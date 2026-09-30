@@ -1,0 +1,37 @@
+# ---- core (always required) ----
+pandas
+tqdm
+
+# ---- extra: ssh ----
+# asyncssh
+
+# ---- extra: vnc ----
+# asyncvnc
+
+# ---- extra: openai ----
+# openai
+
+# ---- extra: dns ----
+# dnspython
+
+# ---- extra: mdns ----
+# zeroconf
+
+# ---- extra: playwright ----
+# playwright
+
+# ---- extra: arrow ----
+# pyarrow
+
+# ---- extra: wifi (optional, for WifiSession) ----
+# pywifi
+
+# ---- extra: bluetooth (optional, for BluetoothSession) ----
+# bleak
+
+# ---- dev / test ----
+# ruff
+# mypy
+# pytest
+# pytest-asyncio
+# types-requests

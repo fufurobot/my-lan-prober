@@ -52,7 +52,7 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
-addopts = "-q --strict-markers"
+addopts = "-q --strict-markers -p no:cacheprovider"
 
 [dependency-groups]
 dev = [

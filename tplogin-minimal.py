@@ -5,6 +5,9 @@ Resolves configured hostnames, probes common ports, identifies services
 (including Jupyter on port 8888), scrapes TP-Link router DHCP leases via
 Playwright, and enriches lease data with ICMP ping and port scan results.
 
+All outputs (HTML dump, CSVs, per-host SSH scripts) are written under the
+``data/`` directory, which is created automatically.
+
 Port detection timeout (TCP connect phase) can be configured via:
   * CLI:  --port-timeout SECONDS  (or -t SECONDS)
   * ENV:  PORT_TIMEOUT=SECONDS
@@ -50,11 +53,17 @@ PORT_SCAN_TIMEOUT: float = DEFAULT_PORT_TIMEOUT
 HTTP_TIMEOUT: int = 5
 PING_TIMEOUT: int = 2
 
-# Output files
+# ---------------------------------------------------------------------------
+# Output directory: everything goes under ./data
+# ---------------------------------------------------------------------------
+DATA_DIR: Path = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Output files (all under DATA_DIR)
 SSH_CONFIG_FILENAME: str = "ssh.sh"
-ROUTER_HTML_FILE: str = "tplogin-arp.html"
-DNS_CSV_FILE: str = "dns-resolved-hosts.csv"
-ENRICHED_CSV_FILE: str = "tplogin-arp-enriched.csv"
+ROUTER_HTML_FILE: Path = DATA_DIR / "tplogin-arp.html"
+DNS_CSV_FILE: Path = DATA_DIR / "dns-resolved-hosts.csv"
+ENRICHED_CSV_FILE: Path = DATA_DIR / "tplogin-arp-enriched.csv"
 
 # Logging
 logging.basicConfig(
@@ -528,8 +537,10 @@ def write_ssh_config(
     """
     Write an SSH helper script for the given host.
 
+    The script is written to ``data/<host>/ssh.sh``.
+
     Args:
-        host: Logical host name (used as the output directory).
+        host: Logical host name (used as the subdirectory under ``data/``).
         ip: Target IP for SSH.
         port: SSH port on the target.
         tunnels: Optional list of ``(local_port, remote_port)`` pairs. Each
@@ -539,8 +550,8 @@ def write_ssh_config(
             several host scripts are run simultaneously (e.g. 1000 -> 8888
             becomes local 9888).
     """
-    path = Path(host)
-    path.mkdir(exist_ok=True)
+    path = DATA_DIR / host
+    path.mkdir(parents=True, exist_ok=True)
     config_path = path / SSH_CONFIG_FILENAME
 
     parts: List[str] = [
@@ -606,6 +617,8 @@ def get_password() -> str:
 def scrape_router_dhcp() -> pd.DataFrame:
     """
     Scrape the TP-Link router DHCP lease table via Playwright.
+
+    The raw HTML dump is written to ``data/tplogin-arp.html``.
 
     Returns a DataFrame with columns:
         host, mac_address, ip_address, valid_time
@@ -707,6 +720,7 @@ def run(port_timeout: Optional[float] = None) -> pd.DataFrame:
     global PORT_SCAN_TIMEOUT
     PORT_SCAN_TIMEOUT = resolve_port_timeout(port_timeout)
     log.info("Port detection timeout: %.3fs", PORT_SCAN_TIMEOUT)
+    log.info("Output directory: %s", DATA_DIR.resolve())
 
     # ------------------------------------------------------------------
     # 1. DNS resolution & direct host testing
@@ -750,16 +764,36 @@ def run(port_timeout: Optional[float] = None) -> pd.DataFrame:
     df["detected_services"] = df.progress_apply(_summarise, axis=1)
 
     # ------------------------------------------------------------------
-    # 6. Write SSH helper scripts
+    # 6. Write SSH helper scripts (under data/<host>/ssh.sh)
     # ------------------------------------------------------------------
     for entry in df.itertuples():
-        # if not entry.icmp_ping:
-        #     continue
-        for ssh_port in (22, 2222, 8022):
-            svc = getattr(entry, f"port_{ssh_port}_service", None)
+        # Find the SSH port (try common alternatives in priority order).
+        ssh_port: Optional[int] = None
+        for candidate in (22, 2222, 8022):
+            svc = getattr(entry, f"port_{candidate}_service", None)
             if pd.notna(svc) and "SSH" in str(svc):
-                write_ssh_config(entry.host, entry.ip_address, ssh_port)
+                ssh_port = candidate
                 break
+        if ssh_port is None:
+            continue
+
+        # Forward every other detected service through the SSH tunnel so that,
+        # e.g., a Jupyter server detected on :8888 is reachable at
+        # http://localhost:8888 on this machine.
+        tunnels: List[Tuple[int, int]] = []
+        for port in COMMON_PORTS:
+            if port == ssh_port:
+                continue
+            svc = getattr(entry, f"port_{port}_service", None)
+            if pd.notna(svc):
+                tunnels.append((port, port))
+
+        write_ssh_config(
+            entry.host,
+            entry.ip_address,
+            ssh_port,
+            tunnels=tunnels or None,
+        )
 
     # ------------------------------------------------------------------
     # 7. Export enriched results
@@ -774,5 +808,9 @@ def run(port_timeout: Optional[float] = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    import os
+
+    load_dotenv()  # loads .env from the current working directory
     args = parse_cli_args()
     run(port_timeout=args.port_timeout)

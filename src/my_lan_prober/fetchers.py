@@ -93,6 +93,62 @@ def _frame(rows: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _strip_tags(cell: str) -> str:
+    return re.sub(r"<[^>]*>", "", cell).replace("&nbsp;", " ").strip()
+
+
+def _parse_lease_table(html: str) -> pd.DataFrame:
+    """Parse an HTML ``<table>`` into a DataFrame using only the stdlib.
+
+    The TP-Link lease table is a flat grid, so a cell-wise scan is enough —
+    and unlike ``pandas.read_html`` it needs no third-party parser.
+    """
+    from html.parser import HTMLParser
+
+    class TableParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.rows: List[List[str]] = []
+            self._row: Optional[List[str]] = None
+            self._cell: Optional[List[str]] = None
+            self._depth = 0
+
+        def handle_starttag(self, tag: str, attrs: Any) -> None:
+            if tag == "tr":
+                self._row = []
+            elif tag in ("td", "th") and self._row is not None:
+                self._cell = []
+                self._depth = 1
+            elif self._cell is not None:
+                self._depth += 1
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in ("td", "th") and self._cell is not None:
+                self._row.append("".join(self._cell).strip())
+                self._cell = None
+                self._depth = 0
+            elif tag == "tr" and self._row is not None:
+                if self._row:
+                    self.rows.append(self._row)
+                self._row = None
+            elif self._cell is not None:
+                self._depth = max(1, self._depth - 1)
+
+        def handle_data(self, data: str) -> None:
+            if self._cell is not None:
+                self._cell.append(data)
+
+    parser = TableParser()
+    parser.feed(html)
+    if not parser.rows:
+        return pd.DataFrame(columns=["host", "mac_address", "ip_address", "valid_time"])
+
+    width = max(len(row) for row in parser.rows)
+    normalised = [row + [""] * (width - len(row)) for row in parser.rows]
+    columns = ["host", "mac_address", "ip_address", "valid_time"][:width]
+    return pd.DataFrame(normalised, columns=columns)
+
+
 # ---------------------------------------------------------------------------
 # Platform parsers
 # ---------------------------------------------------------------------------
@@ -383,12 +439,22 @@ class PlaywrightFetcher(ARPTableFetcher):
 
     @staticmethod
     def parse_html(path: Any) -> pd.DataFrame:
-        """Read the DHCP lease table out of the dumped HTML."""
-        frame = pd.read_html(path)[0]
+        """Read the DHCP lease table out of the dumped HTML.
+
+        Uses ``pandas.read_html`` when an HTML parser is installed, and falls
+        back to a stdlib parser otherwise.  (``tplogin-minimal.py`` relied on
+        ``read_html`` alone, which needs ``lxml`` — a dependency it never
+        declared, so it raised ``ImportError`` on a clean install.)
+        """
+        try:
+            frame = pd.read_html(path)[0]
+        except (ImportError, ValueError):
+            frame = _parse_lease_table(Path(path).read_text(encoding="utf-8"))
+
+        frame = frame.iloc[1:, :].reset_index(drop=True)
         frame.columns = ["host", "mac_address", "ip_address", "valid_time"][
             : len(frame.columns)
         ]
-        frame = frame.iloc[1:, :].reset_index(drop=True)
         frame["mac_address"] = frame["mac_address"].map(normalise_mac)
         frame["mode"] = "dhcp"
         frame["ip"] = frame["ip_address"]

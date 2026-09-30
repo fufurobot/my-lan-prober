@@ -267,3 +267,39 @@ def test_windows_fetcher_uses_a_list_argv(monkeypatch):
 
     assert isinstance(captured["cmd"], (list, tuple))
     assert captured["shell"] is False
+
+
+# ---------------------------------------------------------------------------
+# Lease-table HTML parsing
+# ---------------------------------------------------------------------------
+LEASE_HTML = """<meta charset="utf-8">
+<table id="dhcpLeaseTbl" class="dataGrid"><tbody>
+<tr class="dataGrid_header_tr"><td>主机</td><td>MAC地址</td><td>IP地址</td><td>有效时间</td></tr>
+<tr><td title="arch-n551jw">arch-n551jw</td><td title="08-62-66-B4-2C-D2">08-62-66-B4-2C-D2</td><td title="192.168.1.104">192.168.1.104</td><td>40:10:04</td></tr>
+<tr><td title="gpdwin4">gpdwin4</td><td title="B0-DC-EF-86-CB-FD">B0-DC-EF-86-CB-FD</td><td title="192.168.1.105">192.168.1.105</td><td>33:44:38</td></tr>
+</tbody></table>"""
+
+
+def test_parse_lease_table_works_without_a_third_party_html_parser():
+    """The stdlib fallback must handle the real TP-Link markup."""
+    from my_lan_prober.fetchers import _parse_lease_table
+
+    frame = _parse_lease_table(LEASE_HTML)
+
+    assert list(frame.columns) == ["host", "mac_address", "ip_address", "valid_time"]
+    assert frame.iloc[1]["host"] == "arch-n551jw"
+    assert frame.iloc[2]["ip_address"] == "192.168.1.105"
+
+
+def test_playwright_parse_html_normalises_the_lease_frame(tmp_path):
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    path = tmp_path / "leases.html"
+    path.write_text(LEASE_HTML, encoding="utf-8")
+
+    frame = PlaywrightFetcher.parse_html(path)
+
+    assert len(frame) == 2
+    assert set(frame["mode"]) == {"dhcp"}
+    assert list(frame["ip"]) == ["192.168.1.104", "192.168.1.105"]
+    assert frame.iloc[0]["mac_address"] == "08:62:66:b4:2c:d2"

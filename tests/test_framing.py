@@ -96,13 +96,23 @@ def test_length_prefix_framing_little_endian():
 
 
 def test_length_prefix_framing_header_bytes_offsets_payload_start():
-    """A TLS record is ``type(1) version(2) length(2)`` — length is the
-    *payload* length, so the prefix sits 3 bytes before the payload."""
-    framing = LengthPrefixFraming(2, header_bytes=5)
-    buf = bytearray(b"\x16\x03\x01\x00\x03abc")
+    """TLS record: ``type(1) version(2) length(2)``.
 
-    assert framing.frame(buf) == [b"abc"]
+    The length field is at offset 3, not offset 0, so the prefix must be
+    given an explicit ``prefix_offset``.  Reading from offset 0 would take
+    ``0x16 0x03`` as the length (5635) instead of the real ``0x00 0x05``.
+    """
+    framing = LengthPrefixFraming(2, header_bytes=5, prefix_offset=3)
+    buf = bytearray(b"\x16\x03\x01\x00\x05abcde")
+
+    assert framing.frame(buf) == [b"abcde"]
     assert buf == b""
+
+
+def test_length_prefix_framing_encode_writes_prefix_at_offset():
+    framing = LengthPrefixFraming(2, header_bytes=5, prefix_offset=3)
+
+    assert framing.encode(b"abcde") == b"\x00\x00\x00\x00\x05abcde"
 
 
 def test_length_prefix_framing_encode_adds_prefix():
@@ -277,7 +287,7 @@ def test_multiplex_framing_waits_for_complete_frame():
     buf = bytearray(b"\x00\x00\x03\x00\x00\x00\x00\x00\x01ab")
 
     assert framing.frame(buf) == []
-    assert len(buf) == 10
+    assert buf == b"\x00\x00\x03\x00\x00\x00\x00\x00\x01ab"
 
 
 def test_multiplex_framing_encode_prefixes_header():

@@ -222,3 +222,5 @@ data
 # Local scratch / caches (workspace-local uv cache keeps uv inside the sandbox)
 .uv-cache
 .playwright-user-data
+.pytest_cache
+pytest-cache-files-*

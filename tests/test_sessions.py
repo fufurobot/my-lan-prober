@@ -36,6 +36,7 @@ class FakeSession(AsyncSession):
     def __init__(self, chunks=None, **kwargs):
         super().__init__(**kwargs)
         self.sent = []
+        self.closed = False
         self._chunks = list(chunks or [])
 
     async def send_async(self, data, recv_debounce_seconds=0.1):
@@ -48,6 +49,15 @@ class FakeSession(AsyncSession):
         chunk = self._chunks.pop(0)
         self._fire_io("recv", chunk)
         return chunk
+
+    def close(self):
+        self.closed = True
+
+
+def layered(spec, chunks=None):
+    """A ``TableSession`` over a scripted root: returns ``(top, root)``."""
+    root = FakeSession(chunks=chunks)
+    return TableSession(spec=spec, base=root), root
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +106,12 @@ def test_send_and_read_are_sync_wrappers_over_the_async_api():
 
 def test_session_is_abstract():
     with pytest.raises(TypeError):
-        Session()
+        Session()  # type: ignore[abstract]
+
+
+def test_async_session_cannot_be_instantiated_without_the_io_methods():
+    with pytest.raises(TypeError):
+        AsyncSession()  # type: ignore[abstract]
 
 
 # ---------------------------------------------------------------------------
@@ -135,14 +150,14 @@ def test_close_is_safe_on_a_session_without_a_base():
 # ---------------------------------------------------------------------------
 def test_table_session_uses_spec_framing_to_split_incoming_bytes():
     spec = LayerSpec("Lines", DelimiterFraming(b"\r\n"))
-    session = TableSession(spec=spec, chunks=[b"220 hi\r\n250 ok\r\n"])
+    session, _ = layered(spec, chunks=[b"220 hi\r\n250 ok\r\n"])
 
     assert session.read() == [b"220 hi", b"250 ok"]
 
 
 def test_table_session_buffers_partial_frames_across_reads():
     spec = LayerSpec("Lines", DelimiterFraming(b"\r\n"))
-    session = TableSession(spec=spec, chunks=[b"220 hi\r", b"\n250 ok\r\n"])
+    session, _ = layered(spec, chunks=[b"220 hi\r", b"\n250 ok\r\n"])
 
     assert session.read() is None
     assert session.read() == [b"220 hi", b"250 ok"]
@@ -150,11 +165,11 @@ def test_table_session_buffers_partial_frames_across_reads():
 
 def test_table_session_encode_applies_framing_on_send():
     spec = LayerSpec("Lines", DelimiterFraming(b"\r\n"))
-    session = TableSession(spec=spec)
+    session, root = layered(spec)
 
     session.send(b"EHLO")
 
-    assert session.sent == [b"EHLO\r\n"]
+    assert root.sent == [b"EHLO\r\n"]
 
 
 def test_table_session_applies_transform_hooks_on_both_directions():
@@ -164,42 +179,42 @@ def test_table_session_applies_transform_hooks_on_both_directions():
         transform_out=lambda b: bytes(x + 1 for x in b),
         transform_in=lambda b: bytes(x - 1 for x in b),
     )
-    session = TableSession(spec=spec, chunks=[b"bcd\r\n"])
+    session, root = layered(spec, chunks=[b"bcd\r\n"])
 
     session.send(b"abc")
-    assert session.sent == [b"bcd\r\n"]
+    assert root.sent == [b"bcd\r\n"]
     assert session.read() == [b"abc"]
 
 
 def test_table_session_sends_handshake_once_on_first_send():
     spec = LayerSpec("Greet", handshake_out=b"EHLO\r\n")
-    session = TableSession(spec=spec)
+    session, root = layered(spec)
 
     session.send(b"A")
     session.send(b"B")
 
-    assert session.sent == [b"EHLO\r\n", b"A", b"B"]
+    assert root.sent == [b"EHLO\r\n", b"A", b"B"]
 
 
 def test_table_session_supports_a_callable_handshake():
     spec = LayerSpec("Greet", handshake_out=lambda: b"PRI *\r\n")
-    session = TableSession(spec=spec)
+    session, root = layered(spec)
 
     session.send(b"A")
 
-    assert session.sent == [b"PRI *\r\n", b"A"]
+    assert root.sent == [b"PRI *\r\n", b"A"]
 
 
 def test_table_session_with_no_handshake_sends_only_the_payload():
-    session = TableSession(spec=LayerSpec("Plain"))
+    session, root = layered(LayerSpec("Plain"))
 
     session.send(b"A")
 
-    assert session.sent == [b"A"]
+    assert root.sent == [b"A"]
 
 
 def test_table_session_read_returns_none_when_transport_is_empty():
-    session = TableSession(spec=LayerSpec("Plain"))
+    session, _ = layered(LayerSpec("Plain"))
 
     assert session.read() is None
 
@@ -225,11 +240,13 @@ def test_factory_build_creates_a_table_session_for_a_single_layer():
 
 
 def test_factory_build_stacks_layers_base_upwards():
-    session = SessionFactory.build(["TCP", "SSH"], root_session=FakeSession())
+    root = FakeSession()
+    session = SessionFactory.build(["TCP", "SSH"], root_session=root)
 
     assert session.spec is LAYERS["SSH"]
     assert session._base.spec is LAYERS["TCP"]
-    assert session.root().spec is LAYERS["TCP"]
+    assert session._base._base is root
+    assert session.root() is root
 
 
 def test_factory_attaches_persistor_and_frame_size_to_the_top_only():
@@ -245,7 +262,6 @@ def test_factory_attaches_persistor_and_frame_size_to_the_top_only():
 
 def test_factory_upgrade_reuses_the_live_root():
     root = FakeSession()
-    session = SessionFactory.build(["TCP"], root_session=root)
 
     upgraded = SessionFactory.upgrade(root, ["TLS", "HTTP/1.1"])
 
@@ -277,6 +293,9 @@ def test_factory_uses_override_class_when_a_layer_declares_one():
         async def read_async(self, recv_debounce_seconds=0.1):
             return None
 
+        def close(self):
+            pass
+
     spec = LayerSpec("Custom", override_class=Custom, description="t")
     from my_lan_prober.layers import SessionRegistry
 
@@ -290,7 +309,7 @@ def test_factory_uses_override_class_when_a_layer_declares_one():
 
 
 def test_factory_build_without_a_root_session_opens_a_real_socket():
-    """Building on TCP with no supplied root must not crash construction."""
+    """Building on TCP with no supplied root must open a real socket."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -298,7 +317,8 @@ def test_factory_build_without_a_root_session_opens_a_real_socket():
 
     try:
         session = SessionFactory.build(["TCP"], host="127.0.0.1", port=port)
-        assert isinstance(session, AsyncSocketSession)
+        assert isinstance(session, TableSession)
+        assert isinstance(session.root(), AsyncSocketSession)
         session.close()
     finally:
         server.close()

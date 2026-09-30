@@ -224,3 +224,4 @@ data
 .playwright-user-data
 .pytest_cache
 pytest-cache-files-*
+.pytest-tmp

@@ -112,7 +112,7 @@ def test_resume_loads_rows_into_a_fresh_instance(persistor):
     persistor.store_full({"host": "alpha", "ip": "10.0.0.1"})
     persistor.persist()
 
-    fresh = type(persistor)()
+    fresh = type(persistor)(persistor.path)
     fresh.resume()
     history = fresh.history()
 
@@ -122,11 +122,11 @@ def test_resume_loads_rows_into_a_fresh_instance(persistor):
 
 
 def test_resume_on_missing_path_is_a_noop(persistor):
-    fresh = type(persistor)()
+    persistor.path = persistor.path.parent / "definitely-missing"
 
-    fresh.resume()
+    persistor.resume()
 
-    assert len(fresh.history()) == 0
+    assert len(persistor.history()) == 0
 
 
 # ---------------------------------------------------------------------------

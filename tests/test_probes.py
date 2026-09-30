@@ -68,20 +68,23 @@ def test_identifier_detects_jupyter_from_the_tornado_server_header():
 
 
 def test_identifier_detects_jupyter_on_port_8888():
+    """Port 8888 needs an ``ip`` — the original script always passed one."""
     identifier = ServiceIdentifier(deep_probe=False)
 
-    assert identifier.identify("HTTP/1.1 200 OK\n_xsrf: abc", 8888) == "Jupyter Server"
+    assert identifier.identify("HTTP/1.1 200 OK\n_xsrf: abc", 8888, ip="10.0.0.5") == (
+        "Jupyter Server"
+    )
 
 
 def test_identifier_detects_plain_jupyter_marker():
     identifier = ServiceIdentifier(deep_probe=False)
 
-    assert identifier.identify("HTTP/1.1 200 OK\nserver: jupyter_server/2.0", 8888) == (
-        "Jupyter Server"
-    )
+    assert identifier.identify(
+        "HTTP/1.1 200 OK\nserver: jupyter_server/2.0", 8888, ip="10.0.0.5"
+    ) == "Jupyter Server"
 
 
-def test_identifier_port_8888_without_jupyter_markers_is_http():
+def test_identifier_port_8888_without_ip_or_markers_is_http():
     identifier = ServiceIdentifier(deep_probe=False)
 
     assert identifier.identify("HTTP/1.1 200 OK\nserver: nginx", 8888) == "HTTP (Alt)"
@@ -100,7 +103,15 @@ def test_identifier_port_8888_without_jupyter_markers_is_http():
         ("HTTP/1.1 200 OK\r\nserver: nginx\r\n", 80, "HTTP"),
         ("HTTP/1.1 200 OK\r\nserver: nginx\r\n", 443, "HTTPS"),
         ("HTTP/1.0 404 Not found\r\nconnection: close\r\n", 5800, "HTTP"),
-        ("HTTP/1.1 301 Moved Permanently\r\nX-Powered-By: Express\r\n", 6099, "NapCatQQ WebUI"),
+        # Real NapCatQQ capture (from data/tplogin-arp-enriched.csv).
+        (
+            "HTTP/1.1 301 Moved Permanently\r\n"
+            "X-Powered-By: Express\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Location: /webui\r\n",
+            6099,
+            "NapCatQQ WebUI",
+        ),
         ("HTTP/1.1 200 OK\r\nserver: caddy\r\n", 3080, "DeepSeek Harness"),
         ("HTTP/1.1 200 OK\r\nserver: nonebot2\r\n", 8080, "NoneBot2"),
         ("HTTP/1.1 200 OK\r\n", 11434, "Ollama (HTTP)"),

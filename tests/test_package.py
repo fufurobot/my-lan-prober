@@ -31,13 +31,14 @@ def test_public_api_is_importable_from_the_package_root():
     assert Config is not None
     assert Engine is not None
     assert LAYERS["TCP"] is not None
-    assert issubclass(TableSession, Framing.__class__.__mro__[-1].__class__) or True
 
 
 def test_the_designed_abstractions_are_exported():
     for symbol in (
         LayerSpec,
         SessionFactory,
+        TableSession,
+        Framing,
         Handler,
         HandlerChain,
         SocketBannerHandler,

@@ -218,3 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 uv.lock
 data
+
+# Local scratch / caches (workspace-local uv cache keeps uv inside the sandbox)
+.uv-cache
+.playwright-user-data

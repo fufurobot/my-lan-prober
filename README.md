@@ -1,20 +1,19 @@
-# ProbeStack
+# my-lan-prober
 
-> Probe a LAN, walk the protocol stack, harvest the DHCP leases, and enrich
-> every host with parsed service banners — all from one declarative,
-> async-first Python toolkit.
+> Probe a LAN, identify the services behind every open port, and enrich the
+> router's DHCP lease table — from one declarative, async-first toolkit.
 
-ProbeStack discovers live hosts, identifies the services behind each open
-port, and correlates everything with your router's DHCP lease table. It
-does this by treating every protocol as a **layer in a session stack**
-(`TCP → TLS → HTTP/1.1 → gRPC`, `UDP → QUIC → HTTP/3 → DNS`, …) and every
-scan as a **chain of handlers** that dispatch on what the wire reveals.
+`my-lan-prober` discovers live hosts, identifies the services behind each open
+port, and correlates everything with your router's DHCP lease table. It treats
+every protocol as a **layer in a session stack** (`TCP → TLS → HTTP/1.1`) and
+every scan as a **chain of handlers** that dispatch on what the wire reveals.
 
-It is built to be *extended*: add a protocol, add a persistence backend, add
-a handler, or plug in a new ARP source — all without touching the core.
+It grew out of a tested single-file script (`tplogin-minimal.py`); the
+service-identification rules are a faithful, behaviour-identical port of that
+script, now behind testable seams.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Built with uv](https://img.shields.io/badge/built%20with-uv-blueviolet)](https://github.com/astral-sh/uv)
 
 ---
@@ -32,14 +31,10 @@ a handler, or plug in a new ARP source — all without touching the core.
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [Environment variables](#environment-variables)
-- [Extending ProbeStack](#extending-probestack)
-  - [Add a protocol layer](#add-a-protocol-layer)
-  - [Add a handler](#add-a-handler)
-  - [Add a persistor](#add-a-persistor)
-  - [Add an ARP source](#add-an-arp-source)
+- [Extending my-lan-prober](#extending-my-lan-prober)
 - [Output](#output)
 - [Design notes](#design-notes)
-- [Contributing](#contributing)
+- [Development](#development)
 - [License](#license)
 
 ---
@@ -47,48 +42,51 @@ a handler, or plug in a new ARP source — all without touching the core.
 ## Why
 
 Typical LAN recon means juggling `nmap`, `arp -a`, a browser session on the
-router, a pile of ad-hoc `socket.connect()` calls, and some regexes to
-guess what's listening. ProbeStack folds all of that into one pipeline with
-**first-class abstractions** for the things you keep re-implementing:
+router, a pile of ad-hoc `socket.connect()` calls, and some regexes to guess
+what's listening. `my-lan-prober` folds all of that into one pipeline with
+first-class abstractions for the things you keep re-implementing:
 
-- **Protocols as data.** ~70 protocols are described in a single
-  `LAYERS` table; a protocol layer is a framing strategy + optional
-  encrypt/decrypt transforms + optional handshake bytes.
+- **Protocols as data.** 79 protocols are described in a single `LAYERS`
+  table; a protocol layer is a framing strategy plus optional
+  encrypt/decrypt transforms and an optional handshake payload.
 - **Parsed packets, not raw bytes.** Handlers own the payload gluing and
-  persist structured rows — not a wall of `b"...\r\n\r\n..."`.
+  persist structured rows.
 - **Every knob configurable.** CLI flag > env var > default; nothing is
   hard-coded.
-- **Chain-of-responsibility by construction.** `<<` and `>>` compose
-  handlers into pipelines; `+=` dispatches on banner matches.
-- **Optional dependencies, lazy-loaded.** `asyncssh`, `asyncvnc`,
-  `openai`, `playwright`, `zeroconf`, `pyarrow` are imported only when the
-  layer that needs them is instantiated.
+- **Chain-of-responsibility by construction.** `<<` and `>>` compose handlers
+  into pipelines; `+=` dispatches on banner matches.
+- **Optional dependencies, lazily imported.** `playwright`, `asyncssh`, and
+  `python-dotenv` are imported only when the feature that needs them is used.
 
 ## Features
 
-- 🔍 **Parallel port scanning** — bounded by `--workers` (defaults to
-  `os.cpu_count()`).
-- 🧩 **Layered protocol detection** — TCP, UDP, TLS, SSH, HTTP/1.1, HTTP/2,
-  HTTP/3, QUIC, WebSocket, gRPC, MQTT, AMQP, Kafka, DNS, mDNS, NFS, SMB,
-  RDP, VNC, LDAP, SMTP/IMAP/POP3, SIP, RTP, CoAP, and more.
-- 🏠 **DHCP lease scraping** with automatic source fallback:
-  TP-Link (`tplogin.cn`) → Unix/Windows ARP table → OpenWRT over SSH.
-- 🎭 **Playwright fetcher** with persistent user-data dir, browser auto-
-  detection, and a `run(context, password)` hook you fill in from
-  `playwright codegen`.
-- 💾 **Pluggable persistence** — Pickle, JSONL, SQLite, Arrow/Plasma; or
+- 🔍 **Port probing** across 17 common LAN ports, with a configurable TCP
+  connect timeout.
+- 🧩 **Layered protocol detection** — 79 layers described as data: TCP, UDP,
+  TLS, SSH, HTTP/1.1, HTTP/2, HTTP/3, QUIC, WebSocket, gRPC, MQTT, AMQP,
+  Kafka, DNS, mDNS, NFS, SMB, RDP, VNC, LDAP, SMTP/IMAP/POP3, SIP, RTP, CoAP,
+  and more.
+- 🏠 **DHCP lease scraping** with automatic source fallback: TP-Link
+  (`tplogin.cn`) → local ARP table → OpenWRT over SSH.
+- 🖥️ **OS-independent local ARP fallback** — tries `/proc/net/arp`, then
+  `ip neigh`, then `arp -an`/`arp -a`, so it works on Linux, macOS, BSD, and
+  Windows with no extra dependency. This is what you get when `tplogin.cn`
+  does *not* point at a TP-Link router.
+- 🎭 **Playwright fetcher** for routers with a web UI, replicating the tested
+  login flow.
+- 💾 **Pluggable persistence** — Pickle, JSONL, SQLite, Arrow/Parquet; or
   in-memory if you skip it entirely.
 - 🧵 **One asyncio loop per process**, safely bridged to a sync API — no
   greenlets, no "sync API inside asyncio" errors.
-- 🧪 **Everything testable** — handlers, sessions, persistors are
-  independent; you can drive any of them by hand.
+- 🧪 **Everything testable** — 267 tests; handlers, sessions, and fetchers are
+  independent and can be driven by hand.
 
 ## Architecture
 
 ### Layered session stacks
 
-Every protocol is a **decorator over the one below it**. You describe a
-stack by name and ProbeStack builds it:
+Every protocol is a **decorator over the one below it**. You describe a stack
+by name and the factory builds it:
 
 ```mermaid
 flowchart LR
@@ -99,74 +97,75 @@ flowchart LR
 SessionFactory.build(["TCP", "TLS", "HTTP/1.1", "WebSocket", "MQTT"])
 ```
 
-The stack spec mirrors real protocol dependencies:
-
-| Application | Stack |
-|---|---|
-| HTTPS | `["TCP", "TLS", "HTTP/1.1"]` |
-| HTTP/3 | `["UDP", "QUIC", "HTTP/3"]` |
-| gRPC | `["TCP", "TLS", "HTTP/2", "gRPC"]` |
-| DoH | `["TCP", "TLS", "HTTP/2", "DNS"]` |
-| SFTP | `["TCP", "SSH", "SFTP"]` |
-| NFS | `["TCP", "ONC RPC", "NFS"]` |
-| MQTT over WSS | `["TCP", "TLS", "HTTP/1.1", "WebSocket", "MQTT"]` |
-| WebRTC media | `["UDP", "DTLS", "SRTP", "WebRTC"]` |
-| CoAP over DTLS | `["UDP", "DTLS", "CoAP"]` |
-
 A layer is a single `LayerSpec` entry:
 
 ```python
 "TLS": LayerSpec(
-    name="TLS",
-    framing=LengthPrefixFraming(2, header_bytes=5),
-    transform_out=tls_encrypt,
-    transform_in=tls_decrypt,
+    "TLS",
+    LengthPrefixFraming(2, header_bytes=5, prefix_offset=3),
     allowed_bases=("TCP",),
     ports_hint=(443, 465, 636, 853, 993, 995),
     description="TLS / SSL over TCP",
 ),
 ```
 
-If a protocol needs real code (a library, an async state machine), you set
-`override_class` and ship one small class; everything else is data.
+> **Note on TLS framing.** A TLS record header is
+> `type(1) version(2) length(2)` — the length field sits at offset 3, not 0.
+> `design.md` § 1c writes this as `LengthPrefixFraming(2, header_bytes=5)`,
+> which would read the length from offset 0 (that is `0x16 0x03`, i.e. 5635,
+> for a handshake record). The implementation adds an explicit
+> `prefix_offset` and the difference is covered by a test.
+
+`TableSession` is the single concrete class that turns a `LayerSpec` into
+behaviour:
+
+| Field | Meaning |
+|---|---|
+| `framing` | how this layer slices a byte stream into messages |
+| `transform_out` / `transform_in` | byte-level encrypt/decrypt |
+| `handshake_out` | bytes to send once on open (`ClientHello`, `EHLO`, …) |
+| `override_class` | escape hatch — use a hand-written class instead |
+| `allowed_bases` | documentation; the real check is the stack you build |
+| `ports_hint` | suggested ports |
+| `requires` | auth shims this layer typically sits above |
 
 ### Handler chain
 
-Handlers are composed with `<<` and `>>`; dispatch-on-banner uses `+=`:
+Handlers compose with `<<` and `>>`; dispatch-on-banner uses `+=`:
 
 ```python
-scanner = SocketBannerHandler(
-    stack=["TCP"],
-    session=AsyncSocketSession(sock),
-    persistor=JSONLPersistor("scan.jsonl"),
-)
+from my_lan_prober import RegexBannerHandler, SessionFactory, SocketBannerHandler
 
-scanner += RegexBannerHandler(r"^SSH-",        name="SSH",     stack=["TCP", "SSH"])
-scanner += RegexBannerHandler(r"^@RSYNCD",     name="RSYNC",   stack=["TCP", "RSYNC"])
-scanner += RegexBannerHandler(r"TornadoServer", name="Jupyter", stack=["TCP", "TLS", "HTTP/1.1"])
+session = SessionFactory.build(["TCP"], host="192.168.1.104", port=8000)
 
-root = ssh_scanner << http_scanner << generic_scanner
+scanner = SocketBannerHandler(stack=["TCP"], session=session)
+scanner += RegexBannerHandler(r"^SSH-", name="SSH", stack=["TCP", "SSH"])
+scanner += RegexBannerHandler(r"TornadoServer", name="JupyterHub")
+
+result = scanner.handle("192.168.1.104", port=8000)
+print(result.service, result.banner[:60])
 ```
 
 Rules:
 
-- `a << b` → `[a, b]`; `a >> b` → `[b, a]`; chaining is associative.
-- `socket_handler += child` smoke-tests `child.check_banner(b"")` and
-  rejects the child if it raises.
-- When a child declares a deeper `REQUIRED_STACK`, the parent **upgrades
-  the live session in place** — reusing the already-open TCP socket.
+- `a << b` → chain in order; `a >> b` → reversed; chaining is associative.
+- `socket_handler += child` smoke-tests `child.check_banner(b"")` and rejects
+  the child if it raises.
+- When a child declares a deeper `REQUIRED_STACK`, the parent **upgrades the
+  live session in place** — reusing the already-open TCP socket.
 
 ### Persistors
 
-Persistence is optional. When present, it stores **parsed packets**, not
-raw frames:
+Persistence is optional. When present, it stores **parsed packets**, not raw
+frames. `store_full` chains `store` calls through `previous_id` so a
+multi-field packet comes back as one linked row:
 
 ```python
 class Persistor(ABC):
     def history(self) -> pd.DataFrame: ...
     def register(self, column_name: str) -> None: ...
-    def store(self, column: str, data, previous_id=None) -> int: ...
-    def store_full(self, data: dict) -> int: ...     # default impl over store()
+    def store(self, column: str, data, previous_id=None) -> str: ...
+    def store_full(self, data: dict) -> str: ...   # default impl over store()
     def retrieve(self, id, location=None) -> dict | None: ...
     def persist(self, path) -> None: ...
     def resume(self, path) -> None: ...
@@ -179,13 +178,12 @@ Built-in backends: `PicklePersistor`, `JSONLPersistor`, `SQLitePersistor`,
 
 All I/O is `async`. A single **`AsyncBridge`** runs one `asyncio` loop in a
 background thread; sync callers (`Handler.handle`, `Session.send`) block on
-`run_coroutine_threadsafe`. This is how ProbeStack avoids Playwright's
-"sync API inside asyncio loop" trap and keeps the handler chain
-protocol-agnostic:
+`run_coroutine_threadsafe`. This is how the toolkit avoids Playwright's
+"sync API inside asyncio loop" trap:
 
 ```mermaid
 flowchart LR
-    subgraph Worker["Worker thread (sync)"]
+    subgraph Worker["Caller thread (sync)"]
         H[Handler.handle]
     end
     subgraph Bridge["AsyncBridge thread"]
@@ -194,63 +192,55 @@ flowchart LR
     H -->|run_coroutine_threadsafe| L
 ```
 
-Mixed sync/async handlers compose seamlessly — every `Handler` exposes
-`ahandle`, and sync handlers run in an executor.
-
 ## Installation
 
-ProbeStack uses [`uv`](https://github.com/astral-sh/uv):
+`my-lan-prober` uses [`uv`](https://github.com/astral-sh/uv):
 
 ```bash
 # Clone
-git clone https://github.com/<you>/probestack.git
-cd probestack
+git clone https://github.com/<you>/my-lan-prober.git
+cd my-lan-prober
 
 # Create venv and install with dev extras
 uv sync --extra dev
 
 # Optional runtime extras
-uv sync --extra ssh --extra vnc --extra openai --extra dns --extra mdns --extra playwright --extra arrow
+uv sync --extra playwright --extra ssh --extra dotenv
 ```
 
 Or, as a dependency:
 
 ```bash
-uv add probestack[ssh,vnc,openai,dns,mdns,playwright,arrow]
+uv add my-lan-prober[playwright,ssh,dotenv]
 ```
+
+Only `pandas` and `tqdm` are mandatory. Everything else is optional and
+imported lazily.
 
 ## Quick start
 
 ```bash
 # Scan the LAN and enrich the router's DHCP lease table
-uv run probestack
+uv run my-lan-prober
 
-# Custom port timeout, more workers, custom output
-uv run probestack --port-timeout 0.2 --workers 16 --output leases.csv
+# Custom port timeout and output path
+uv run my-lan-prober --port-timeout 0.2 --output data/leases.csv
+
+# Skip the router entirely: use the local OS ARP table
+uv run my-lan-prober --fetcher unix
 
 # Non-interactive TP-Link login (warns: argv leaks to ps / shell history)
-uv run probestack --unsafe-tplogin-password 'hunter2'
+uv run my-lan-prober --unsafe-tplogin-password 'hunter2'
 ```
 
 As a library:
 
 ```python
-from probestack import SessionFactory, SocketBannerHandler, RegexBannerHandler
-from probestack.sessions import AsyncSocketSession
-from probestack.persistors import JSONLPersistor
+from my_lan_prober import Config, Engine
 
-sock = await open_connection("192.168.1.10", 22)
-session = AsyncSocketSession(sock=sock)
-
-scanner = SocketBannerHandler(
-    stack=["TCP"],
-    session=session,
-    persistor=JSONLPersistor("scan.jsonl"),
-)
-scanner += RegexBannerHandler(r"^SSH-", name="SSH", stack=["TCP", "SSH"])
-
-result = scanner.handle("192.168.1.10", port=22)
-print(result.service, result.banner[:60])
+config = Config.resolve(["--fetcher", "unix", "--output", "data/leases.csv"])
+frame = Engine(config).run()
+print(frame[["host", "ip_address", "detected_services"]])
 ```
 
 ## CLI reference
@@ -259,12 +249,11 @@ print(result.service, result.banner[:60])
 |---|---|---|---|
 | `-t, --port-timeout SECONDS` | `PORT_TIMEOUT` | `0.1` | TCP connect timeout |
 | `--workers N` | `SCAN_WORKERS` | `os.cpu_count()` | Parallel worker threads |
-| `--port-strategy {first,all,any}` | `PORT_STRATEGY` | `first` | How ports are tried |
 | `--resolve-host HOST` (repeatable) | `RESOLVE_HOSTS` (csv) | `tplogin.cn,localhost` | Hostnames to resolve & probe |
-| `--output PATH` | `OUTPUT_CSV` | `tplogin-arp-enriched.csv` | Unified output CSV |
-| `--fetcher {tplogin,unix,windows,openwrt}` | `ARP_FETCHER` | `tplogin` | Preferred ARP source |
+| `--output PATH` | `OUTPUT_CSV` | `data/tplogin-arp-enriched.csv` | Unified output CSV |
+| `--fetcher {tplogin,unix,windows,openwrt,auto}` | `ARP_FETCHER` | `tplogin` | Preferred ARP source |
 | `--unsafe-tplogin-password PW` | `TPLOGIN_PASSWORD` | prompt | ⚠️ Non-interactive login — leaks to `ps` |
-| `--browser NAME` | `PW_BROWSER` | auto | Playwright browser engine |
+| `--browser NAME` | `PW_BROWSER` | `chromium` | Playwright browser engine |
 
 **Precedence:** CLI flag > environment variable > default.
 
@@ -276,141 +265,143 @@ Every CLI flag has an env-var equivalent (see table above). Additional:
 |---|---|
 | `TPLOGIN_PASSWORD` | Router admin password (safer than `--unsafe-tplogin-password`) |
 | `PROBESTACK_LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` (default `INFO`) |
-| `PLAYWRIGHT_USER_DATA_DIR` | Override the default `./.playwright-user-data/` |
+| `OPENWRT_HOST` | Host for the OpenWRT SSH fetcher |
 
-## Extending ProbeStack
+## Extending my-lan-prober
 
 ### Add a protocol layer
 
 Drop one entry into the `LAYERS` table:
 
 ```python
-from probestack.layers import LAYERS, LayerSpec
-from probestack.framing import DelimiterFraming
+from my_lan_prober.framing import DelimiterFraming
+from my_lan_prober.layers import LAYERS, LayerSpec
 
 LAYERS["MyProto"] = LayerSpec(
-    name="MyProto",
-    framing=DelimiterFraming(b"\x00"),
+    "MyProto",
+    DelimiterFraming(b"\x00"),
     allowed_bases=("TCP", "TLS"),
     ports_hint=(1234,),
     description="My custom protocol",
 )
 ```
 
-Build a stack:
+Then build a stack with `SessionFactory.build(["TCP", "TLS", "MyProto"])`.
 
-```python
-SessionFactory.build(["TCP", "TLS", "MyProto"])
-```
-
-Need real code? Subclass `AsyncSession` and set `override_class=MyProtoSession`.
+Need real code? Set `override_class` to a `Session` subclass.
 
 ### Add a handler
 
 ```python
-from probestack.handlers import SocketBannerHandler
+from my_lan_prober import ScanResult, SocketBannerHandler
+
 
 class MyProtoBannerHandler(SocketBannerHandler):
     REQUIRED_STACK = ["TCP", "TLS", "MyProto"]
 
-    def planned_columns(self):
-        return ["version", "capabilities"]
-
-    # Override either try_load(col, payload) or load_full(payload) — the other
-    # gets a working default.
     def load_full(self, payload):
-        parsed = my_proto_parse(payload)          # → dict | None
-        return parsed
+        return my_proto_parse(payload)          # → dict | None
 
-    def handle_banner(self, banner):
-        return ScanResult(port=self._port, service="MyProto", banner=banner)
+    def handle_banner(self, banner, port=None):
+        return ScanResult(port=port, service="MyProto", banner=banner)
 ```
 
 ### Add a persistor
 
 ```python
-from probestack.persistors import Persistor
+from my_lan_prober import Persistor
+
 
 class DuckDBPersistor(Persistor):
-    def store(self, column, data, previous_id=None) -> int:
-        ...                                        # return unique record id
+    def store(self, column, data, previous_id=None) -> str:
+        ...                                     # return a unique record id
     def history(self): ...
-    def persist(self, path): ...
-    def resume(self, path): ...
+    def persist(self, path=None): ...
+    def resume(self, path=None): ...
 ```
 
 ### Add an ARP source
 
 ```python
-from probestack.fetchers import ARPTableFetcher
+from my_lan_prober import ARPTableFetcher
+
 
 class FritzBoxFetcher(ARPTableFetcher):
     def iptable(self):
-        # Return DataFrame with at least ["ip", "mode"]
+        # Return a DataFrame with at least ["ip", "mac_address", "mode"]
         ...
 ```
 
 Compose a fallback chain with `>>`:
 
 ```python
-fetcher = TPLoginFetcher() >> FritzBoxFetcher() >> OpenWRTFetcher()
+fetcher = TPLoginFetcher() >> UnixArpFetcher() >> OpenWRTFetcher()
 ```
 
 ## Output
 
-One unified CSV — `tplogin-arp-enriched.csv` by default:
+One unified CSV — `data/tplogin-arp-enriched.csv` by default:
 
 | Column | Meaning |
 |---|---|
 | `host` | Lease hostname reported by the router |
 | `mac_address` | Lease MAC address |
-| `ip` | Lease IPv4 address |
+| `ip_address` | Lease IPv4 address |
+| `valid_time` | Remaining lease time |
 | `mode` | `dhcp` / `arp` / `static` / `dynamic` |
 | `icmp_ping` | ICMP reachability |
-| `resolved_hostname` | Reverse-resolved name (if any) |
 | `detected_services` | Semicolon-joined `port:service` list |
 | `port_<N>_service` | Service identified on port `N` |
 | `port_<N>_banner` | Truncated banner / first response bytes |
-| `ssh_port` | Detected SSH port, if any |
 
-A per-host `ssh.sh` helper is written for every reachable SSH host.
+A per-host `data/<host>/ssh.sh` helper is written for every host with an open
+SSH port. It forwards every other detected service, so a JupyterHub found on
+`:8000` becomes reachable at `http://localhost:8000`:
+
+```bash
+#!/usr/bin/env bash
+ssh \
+    -p 22 \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -L 8000:localhost:8000 \
+    192.168.1.104
+```
 
 ## Design notes
 
-- **`Context` is a `NamedTuple`** `(session, persistor, max_frame_size)`.
-  No behavior — the session owns I/O, the persistor owns storage, the
-  handler owns parsing.
-- **`Session` is transport-only.** `send` / `read` move bytes; the persistor
-  is invoked by the handler's `_on_io` hook after each I/O op.
-- **Persistence is at the top of the stack.** Lower layers keep
+- **`Session` is transport-only.** `send` / `read` move bytes; the persistor is
+  invoked by the handler's `_on_io` hook after each I/O op.
+- **Persistence sits at the top of the stack.** Lower layers keep
   `_persistor=None`; only the last layer stores parsed packets.
-- **`SocketBannerHandler` takes a live session** (an already-open
-  `AsyncSocketSession`) plus a stack spec. When a child needs a deeper
-  stack, the handler upgrades **in place**, reusing the live socket's file
-  descriptor.
+- **`SocketBannerHandler` takes both a stack spec and a live session.** When a
+  child needs a deeper stack, the handler upgrades **in place**, reusing the
+  live socket's file descriptor.
 - **`Framing` strategies** carry the shape of every protocol: stream,
   datagram, length-prefix, varint, delimiter, fixed-size, request-response,
-  multiplex. ~70 protocols collapse to ~8 framing strategies + a data table.
+  multiplex. 79 protocols collapse to 8 framing strategies plus a data table.
+- **Local ARP is the fallback, not the default.** If `tplogin.cn` doesn't
+  resolve to a TP-Link router, the chain falls through to the OS ARP table,
+  which needs no credentials and no extra dependency.
 
-## Contributing
+## Development
 
 ```bash
 uv sync --extra dev
 uv run ruff format .
 uv run ruff check .
-uv run mypy src/probestack
 uv run pytest -q
 ```
 
-Bug reports, protocol additions, and new persistors are welcome. Please
-include a minimal reproduction (a `.pcap` or a live target description
-helps a lot).
+Tests are written test-first: each module's history has a `[WIP][RED]` commit
+that adds failing tests, followed by a `[GREEN]` commit that makes them pass.
 
 ## License
 
-ProbeStack is licensed under the **GNU Affero General Public License v3.0 or
-later**. See [`LICENSE`](LICENSE) for the full text.
+`my-lan-prober` is licensed under the **GNU Affero General Public License v3.0
+or later**. See [`LICENSE`](LICENSE) for the full text.
 
-> Because ProbeStack is a network-facing tool, the AGPL's Section 13
-> (network interaction) applies: if you run a modified version as a
-> service, you must offer the corresponding source to your users.
+> Because this is a network-facing tool, the AGPL's Section 13 (network
+> interaction) applies: if you run a modified version as a service, you must
+> offer the corresponding source to your users.

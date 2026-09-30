@@ -153,7 +153,7 @@ class Engine:
         log.info("[+] DNS resolution results saved to %s", self.config.dns_csv)
 
         # 2. Router DHCP lease table.
-        frame = self.fetch_leases()
+        frame = self.normalise_leases(self.fetch_leases())
 
         # 3. ICMP ping each lease.
         log.info("Performing ICMP ping check...")
@@ -185,6 +185,34 @@ class Engine:
         return frame
 
     # -- helpers --------------------------------------------------------
+    @staticmethod
+    def normalise_leases(frame: pd.DataFrame) -> pd.DataFrame:
+        """Give every ARP/DHCP source the same shape.
+
+        The DHCP scrapers return ``ip_address``/``host``, while the ARP
+        fetchers return ``ip``/``mac_address``.  Downstream steps only need
+        ``ip_address``, ``mac_address``, and something to call the host.
+        """
+        frame = frame.copy()
+
+        if "ip_address" not in frame.columns and "ip" in frame.columns:
+            frame["ip_address"] = frame["ip"]
+        if "ip" not in frame.columns:
+            frame["ip"] = frame.get("ip_address")
+
+        if "mac_address" not in frame.columns:
+            frame["mac_address"] = None
+
+        if "host" not in frame.columns:
+            # ARP tables carry no hostname, so fall back to the address.
+            frame["host"] = frame["ip_address"]
+
+        if "valid_time" not in frame.columns:
+            frame["valid_time"] = None
+
+        frame["host"] = frame["host"].fillna(frame["ip_address"])
+        return frame
+
     def resolve_and_test_hosts(self) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []
         for hostname in self.config.resolve_hosts:

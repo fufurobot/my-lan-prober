@@ -235,3 +235,45 @@ def test_engine_reports_resolved_hosts(config):
     result = StubEngine(config).run()
 
     assert "localhost" in set(pd.read_csv(config.dns_csv)["hostname"])
+
+
+# ---------------------------------------------------------------------------
+# Lease normalisation (DHCP scrapers vs ARP fetchers)
+# ---------------------------------------------------------------------------
+ARP_FRAME = pd.DataFrame(
+    [
+        {"ip": "192.168.1.1", "mac_address": "48:5f:08:9b:22:c5", "mode": "arp"},
+        {"ip": "192.168.1.104", "mac_address": "08:62:66:b4:2c:d2", "mode": "arp"},
+    ]
+)
+
+
+def test_normalise_leases_maps_arp_ip_to_ip_address():
+    frame = Engine.normalise_leases(ARP_FRAME)
+
+    assert "ip_address" in frame.columns
+    assert list(frame["ip_address"]) == ["192.168.1.1", "192.168.1.104"]
+
+
+def test_normalise_leases_falls_back_to_the_address_as_hostname():
+    """ARP tables carry no hostname; the address is the only label."""
+    frame = Engine.normalise_leases(ARP_FRAME)
+
+    assert list(frame["host"]) == ["192.168.1.1", "192.168.1.104"]
+
+
+def test_normalise_leases_keeps_dhcp_frames_intact():
+    frame = Engine.normalise_leases(LEASE_FRAME)
+
+    assert list(frame["host"]) == ["arch-n551jw", "gpdwin4"]
+    assert list(frame["ip_address"]) == ["192.168.1.104", "192.168.1.105"]
+
+
+def test_engine_runs_against_an_arp_style_lease_frame(config):
+    """The engine must work when the source is ARP, not the router."""
+    engine = StubEngine(config, leases=ARP_FRAME, banners={("192.168.1.104", 22): "SSH-2.0-x"})
+
+    result = engine.run()
+
+    assert list(result["ip_address"]) == ["192.168.1.1", "192.168.1.104"]
+    assert "22:SSH" in result.iloc[1]["detected_services"]

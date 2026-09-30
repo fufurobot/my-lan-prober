@@ -9,6 +9,7 @@ synchronous callers can block on coroutines with
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Coroutine, Optional
@@ -53,10 +54,9 @@ class AsyncBridge:
         try:
             loop.run_forever()
         finally:
-            try:
+            with contextlib.suppress(Exception):
+                # Best-effort teardown; the loop is being discarded anyway.
                 loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:  # pragma: no cover - best effort teardown
-                pass
             loop.close()
 
     def shutdown(self, timeout: float = 5.0) -> None:
@@ -108,7 +108,7 @@ class AsyncBridge:
         def target() -> None:
             try:
                 box["value"] = asyncio.run(coro)
-            except BaseException as exc:  # noqa: BLE001 - re-raised below
+            except BaseException as exc:
                 box["error"] = exc
 
         thread = threading.Thread(target=target, daemon=True)

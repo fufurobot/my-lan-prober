@@ -7,14 +7,11 @@ helpers, and export the enriched CSV.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pandas as pd
 import pytest
 
 from my_lan_prober.config import Config
 from my_lan_prober.engine import Engine, write_ssh_config
-
 
 LEASE_FRAME = pd.DataFrame(
     [
@@ -38,9 +35,7 @@ LEASE_FRAME = pd.DataFrame(
 
 @pytest.fixture
 def config(tmp_path):
-    return Config.resolve(
-        ["--output", str(tmp_path / "leases.csv"), "--resolve-host", "localhost"]
-    )
+    return Config.resolve(["--output", str(tmp_path / "leases.csv"), "--resolve-host", "localhost"])
 
 
 class StubEngine(Engine):
@@ -69,9 +64,7 @@ class StubEngine(Engine):
 # write_ssh_config
 # ---------------------------------------------------------------------------
 def test_write_ssh_config_creates_an_executable_script(tmp_path):
-    write_ssh_config(
-        tmp_path, "arch-n551jw", "192.168.1.104", 22, tunnels=[(8888, 8888)]
-    )
+    write_ssh_config(tmp_path, "arch-n551jw", "192.168.1.104", 22, tunnels=[(8888, 8888)])
 
     script = tmp_path / "arch-n551jw" / "ssh.sh"
     assert script.exists()
@@ -130,9 +123,10 @@ def test_engine_leaves_detected_services_empty_when_nothing_is_found(config):
 
     result = engine.run()
 
-    assert result["detected_services"].isna().all() or (
-        result["detected_services"].fillna("") == ""
-    ).all()
+    assert (
+        result["detected_services"].isna().all()
+        or (result["detected_services"].fillna("") == "").all()
+    )
 
 
 def test_engine_records_the_ping_result(config):
@@ -224,7 +218,9 @@ def test_engine_returns_the_enriched_frame(config):
 
 
 def test_engine_handles_an_empty_lease_table(config):
-    engine = StubEngine(config, leases=pd.DataFrame(columns=["host", "mac_address", "ip_address", "valid_time"]))
+    engine = StubEngine(
+        config, leases=pd.DataFrame(columns=["host", "mac_address", "ip_address", "valid_time"])
+    )
 
     result = engine.run()
 
@@ -232,7 +228,7 @@ def test_engine_handles_an_empty_lease_table(config):
 
 
 def test_engine_reports_resolved_hosts(config):
-    result = StubEngine(config).run()
+    StubEngine(config).run()
 
     assert "localhost" in set(pd.read_csv(config.dns_csv)["hostname"])
 

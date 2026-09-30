@@ -20,15 +20,13 @@ import pytest
 
 from my_lan_prober.fetchers import (
     ARPTableFetcher,
-    FetcherChain,
     UnixArpFetcher,
     WindowsArpFetcher,
+    parse_bsd_arp,
     parse_ip_neigh,
     parse_proc_net_arp,
     parse_windows_arp,
-    parse_bsd_arp,
 )
-
 
 # ---------------------------------------------------------------------------
 # Windows arp -a  (captured from a real Windows 11 host)

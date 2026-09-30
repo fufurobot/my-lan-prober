@@ -14,7 +14,14 @@ from my_lan_prober.config import Config, parse_cli_args, resolve_port_timeout
 # Defaults
 # ---------------------------------------------------------------------------
 def test_defaults_match_the_tested_original(monkeypatch):
-    for name in ("PORT_TIMEOUT", "SCAN_WORKERS", "RESOLVE_HOSTS", "OUTPUT_CSV", "ARP_FETCHER", "PW_BROWSER"):
+    for name in (
+        "PORT_TIMEOUT",
+        "SCAN_WORKERS",
+        "RESOLVE_HOSTS",
+        "OUTPUT_CSV",
+        "ARP_FETCHER",
+        "PW_BROWSER",
+    ):
         monkeypatch.delenv(name, raising=False)
 
     config = Config.resolve([])

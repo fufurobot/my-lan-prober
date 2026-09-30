@@ -15,6 +15,7 @@ Each step is a method so tests can substitute any of them.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import socket
 from pathlib import Path
@@ -24,7 +25,7 @@ import pandas as pd
 
 from .config import Config
 from .fetchers import FetcherChain, TPLoginFetcher, UnixArpFetcher, WindowsArpFetcher
-from .probes import COMMON_PORTS, ServiceIdentifier, icmp_ping, probe_service
+from .probes import ServiceIdentifier, icmp_ping, probe_service
 
 log = logging.getLogger(__name__)
 
@@ -80,16 +81,20 @@ def write_ssh_config(
         handle.write(" \\\n    ".join(parts))
         handle.write("\n")
 
-    try:
+    # The script must be runnable, but Windows filesystems often refuse the
+    # mode bits outright — that is not a reason to fail the whole scan.
+    with contextlib.suppress(OSError):
         config_path.chmod(0o755)
-    except OSError:  # pragma: no cover - Windows may refuse
-        pass
 
     if tunnels:
         forwarded = ", ".join(f"{lp + local_port_offset}->{rp}" for lp, rp in tunnels)
         log.info(
             "Wrote SSH config for %s -> %s:%d (%d tunnel(s): %s)",
-            host, ip, port, len(tunnels), forwarded,
+            host,
+            ip,
+            port,
+            len(tunnels),
+            forwarded,
         )
     else:
         log.info("Wrote SSH config for %s -> %s:%d (no tunnels)", host, ip, port)

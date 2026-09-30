@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import pytest
-
 import my_lan_prober
 from my_lan_prober import (
+    LAYERS,
     Config,
     Engine,
     Framing,
     Handler,
     HandlerChain,
-    LAYERS,
     LayerSpec,
     Persistor,
     RegexBannerHandler,

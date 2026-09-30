@@ -15,12 +15,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional
 
 from .bridge import default_bridge
-from .layers import LAYERS, LayerSpec, SessionRegistry
+from .layers import LayerSpec, SessionRegistry
 
 __all__ = [
     "Session",
@@ -209,10 +210,8 @@ class AsyncSocketSession(AsyncSession):
         return raw
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(OSError):
             self._sock.close()
-        except OSError:  # pragma: no cover - already closed
-            pass
         if self._base is not None:
             self._base.close()
 

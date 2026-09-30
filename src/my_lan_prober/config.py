@@ -32,7 +32,8 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "-t", "--port-timeout",
+        "-t",
+        "--port-timeout",
         type=float,
         default=None,
         metavar="SECONDS",
@@ -192,9 +193,7 @@ class Config:
         fetcher = args.fetcher or os.environ.get("ARP_FETCHER", "").strip() or "tplogin"
 
         password = (
-            args.unsafe_tplogin_password
-            or os.environ.get("TPLOGIN_PASSWORD", "").strip()
-            or None
+            args.unsafe_tplogin_password or os.environ.get("TPLOGIN_PASSWORD", "").strip() or None
         )
 
         browser = args.browser or os.environ.get("PW_BROWSER", "").strip() or None

@@ -23,12 +23,7 @@ from my_lan_prober.probes import (
 # HTTP response splitting
 # ---------------------------------------------------------------------------
 def test_split_http_response_separates_head_and_body():
-    raw = (
-        "HTTP/1.1 302 Found\r\n"
-        "server: TornadoServer/6.5.10\r\n"
-        "content-length: 0\r\n"
-        "\r\n"
-    )
+    raw = "HTTP/1.1 302 Found\r\nserver: TornadoServer/6.5.10\r\ncontent-length: 0\r\n\r\n"
 
     status, head, body = split_http_response(raw)
 
@@ -38,7 +33,7 @@ def test_split_http_response_separates_head_and_body():
 
 
 def test_split_http_response_handles_no_blank_line():
-    status, head, body = split_http_response("HTTP/1.0 404 Not found")
+    status, _head, body = split_http_response("HTTP/1.0 404 Not found")
 
     assert status == "HTTP/1.0 404 Not found"
     assert body == ""
@@ -79,9 +74,10 @@ def test_identifier_detects_jupyter_on_port_8888():
 def test_identifier_detects_plain_jupyter_marker():
     identifier = ServiceIdentifier(deep_probe=False)
 
-    assert identifier.identify(
-        "HTTP/1.1 200 OK\nserver: jupyter_server/2.0", 8888, ip="10.0.0.5"
-    ) == "Jupyter Server"
+    assert (
+        identifier.identify("HTTP/1.1 200 OK\nserver: jupyter_server/2.0", 8888, ip="10.0.0.5")
+        == "Jupyter Server"
+    )
 
 
 def test_identifier_port_8888_without_ip_or_markers_is_http():
@@ -197,7 +193,9 @@ def test_sglang_deep_probe_checks_health(monkeypatch):
 
     monkeypatch.setattr(
         "my_lan_prober.probes._http_get",
-        lambda ip, port, path="/", **kw: ("HTTP/1.1 200 OK", "", "") if path == "/health" else (None, None, None),
+        lambda ip, port, path="/", **kw: (
+            ("HTTP/1.1 200 OK", "", "") if path == "/health" else (None, None, None)
+        ),
     )
 
     assert identifier.identify("HTTP/1.1 200 OK\r\n", 30000, ip="10.0.0.5") == "SGLang"
@@ -208,9 +206,9 @@ def test_judge0_deep_probe_reads_about(monkeypatch):
 
     monkeypatch.setattr(
         "my_lan_prober.probes._http_get",
-        lambda ip, port, path="/", **kw: ("HTTP/1.1 200 OK", "", "<h1>Judge0</h1>")
-        if path == "/about"
-        else (None, None, None),
+        lambda ip, port, path="/", **kw: (
+            ("HTTP/1.1 200 OK", "", "<h1>Judge0</h1>") if path == "/about" else (None, None, None)
+        ),
     )
 
     assert identifier.identify("HTTP/1.1 200 OK\r\n", 2358, ip="10.0.0.5") == "Judge0"
@@ -236,8 +234,23 @@ def test_jupyter_status_endpoint_probe(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_common_ports_match_the_tested_original():
     assert COMMON_PORTS == [
-        22, 80, 443, 2222, 8022, 5800, 5900, 8080, 6099, 3080,
-        11434, 8000, 8501, 4000, 30000, 2358, 8888,
+        22,
+        80,
+        443,
+        2222,
+        8022,
+        5800,
+        5900,
+        8080,
+        6099,
+        3080,
+        11434,
+        8000,
+        8501,
+        4000,
+        30000,
+        2358,
+        8888,
     ]
 
 

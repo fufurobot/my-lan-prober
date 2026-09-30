@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence
 
 from .bridge import default_bridge
-from .layers import SessionRegistry
 from .sessions import Session, SessionFactory
 
 log = logging.getLogger(__name__)
@@ -94,9 +93,7 @@ class Handler(ABC):
 
     async def ahandle(self, target: Any, *args: Any, **kwargs: Any) -> Any:
         """Async entry point.  Sync handlers run via the bridge."""
-        return await default_bridge().run_sync(
-            self.handle, target, *args, **kwargs
-        )
+        return await default_bridge().run_sync(self.handle, target, *args, **kwargs)
 
     # -- composition ---------------------------------------------------
     def __lshift__(self, other: "Handler") -> "HandlerChain":
@@ -242,10 +239,10 @@ class HandlerChain(HandlerDispatcher):
         return self
 
     def __lshift__(self, other: Handler) -> "HandlerChain":
-        return HandlerChain(self._handlers + [other])
+        return HandlerChain([*self._handlers, other])
 
     def __rshift__(self, other: Handler) -> "HandlerChain":
-        return HandlerChain([other] + self._handlers)
+        return HandlerChain([other, *self._handlers])
 
     def check_banner(self, banner: bytes) -> bool:
         return any(handler.check_banner(banner) for handler in self._handlers)
@@ -393,9 +390,7 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
             deeper = getattr(child, "REQUIRED_STACK", None)
             if deeper and list(deeper) != self._stack:
                 self._rebind_stack(deeper)
-            return await child.ahandle(
-                target, *args, port=port, banner=banner, **kwargs
-            )
+            return await child.ahandle(target, *args, port=port, banner=banner, **kwargs)
         return self.handle_banner(banner, port)
 
     def handle(self, target: Any, *args: Any, **kwargs: Any) -> Any:

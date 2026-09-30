@@ -100,8 +100,18 @@ def test_every_layer_has_a_ports_hint_or_is_a_pure_shim():
     signalling protocol, so they have no well-known port of their own.
     """
     shims = {
-        "HTTP CONNECT", "ICE", "WebRTC", "GSSAPI", "EAP", "WSS", "SFTP", "SCP",
-        "RTP", "SRTP", "ZRTP", "RTCP",
+        "HTTP CONNECT",
+        "ICE",
+        "WebRTC",
+        "GSSAPI",
+        "EAP",
+        "WSS",
+        "SFTP",
+        "SCP",
+        "RTP",
+        "SRTP",
+        "ZRTP",
+        "RTCP",
     }
 
     for name, spec in LAYERS.items():

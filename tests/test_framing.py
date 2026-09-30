@@ -216,9 +216,7 @@ def test_fixed_size_framing_encode_is_identity():
 # ---------------------------------------------------------------------------
 def test_request_response_framing_with_content_length():
     framing = RequestResponseFraming()
-    buf = bytearray(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA"
-    )
+    buf = bytearray(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA")
 
     assert framing.frame(buf) == [b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"]
     assert buf == b"EXTRA"
@@ -250,9 +248,7 @@ def test_request_response_framing_empty_body_on_204():
 def test_request_response_framing_encodes_headers_with_blank_line():
     framing = RequestResponseFraming()
 
-    assert framing.encode(b"GET / HTTP/1.1\r\nHost: x") == (
-        b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
-    )
+    assert framing.encode(b"GET / HTTP/1.1\r\nHost: x") == (b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
 
 
 def test_request_response_framing_extracts_two_pipelined_responses():

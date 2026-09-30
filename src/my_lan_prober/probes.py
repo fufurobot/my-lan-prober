@@ -40,13 +40,39 @@ RESOLVE_HOSTS: List[str] = ["tplogin.cn", "localhost"]
 
 #: Ports probed for every discovered host (matches the tested original).
 COMMON_PORTS: List[int] = [
-    22, 80, 443, 2222, 8022, 5800, 5900, 8080, 6099, 3080,
-    11434, 8000, 8501, 4000, 30000, 2358, 8888,
+    22,
+    80,
+    443,
+    2222,
+    8022,
+    5800,
+    5900,
+    8080,
+    6099,
+    3080,
+    11434,
+    8000,
+    8501,
+    4000,
+    30000,
+    2358,
+    8888,
 ]
 
 #: Ports where an HTTP GET beats a raw banner grab.
 HTTP_PROBE_PORTS: List[int] = [
-    80, 443, 5800, 8080, 6099, 3080, 8000, 8888, 4000, 30000, 2358, 11434,
+    80,
+    443,
+    5800,
+    8080,
+    6099,
+    3080,
+    8000,
+    8888,
+    4000,
+    30000,
+    2358,
+    11434,
 ]
 
 DEFAULT_PORT_TIMEOUT: float = 0.1
@@ -104,20 +130,14 @@ def _http_get(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Minimal raw HTTP GET.  Returns ``(status, head, body)`` or Nones."""
-    effective_connect_timeout = (
-        DEFAULT_PORT_TIMEOUT if connect_timeout is None else connect_timeout
-    )
+    effective_connect_timeout = DEFAULT_PORT_TIMEOUT if connect_timeout is None else connect_timeout
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(effective_connect_timeout)
             sock.connect((ip, port))
             sock.settimeout(timeout)
 
-            request = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {ip}:{port}\r\n"
-                f"Connection: close\r\n"
-            )
+            request = f"GET {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nConnection: close\r\n"
             for key, value in (extra_headers or {}).items():
                 request += f"{key}: {value}\r\n"
             request += "\r\n"
@@ -128,12 +148,12 @@ def _http_get(
             while True:
                 try:
                     chunk = sock.recv(4096)
-                except socket.timeout:
+                except TimeoutError:
                     break
                 if not chunk:
                     break
                 raw += chunk
-    except (socket.timeout, ConnectionRefusedError, OSError):
+    except (TimeoutError, ConnectionRefusedError, OSError):
         return None, None, None
 
     text = raw.decode("utf-8", errors="ignore")
@@ -141,9 +161,7 @@ def _http_get(
     return status, head, body[:MAX_BODY_BYTES]
 
 
-def _probe_tcp_banner(
-    ip: str, port: int, timeout: Optional[float] = None
-) -> Optional[str]:
+def _probe_tcp_banner(ip: str, port: int, timeout: Optional[float] = None) -> Optional[str]:
     """Connect and read whatever the peer volunteers first."""
     effective_timeout = DEFAULT_PORT_TIMEOUT if timeout is None else timeout
     try:
@@ -151,13 +169,11 @@ def _probe_tcp_banner(
             sock.settimeout(effective_timeout)
             sock.connect((ip, port))
             return sock.recv(1024).decode("utf-8", errors="ignore")
-    except (socket.timeout, ConnectionRefusedError, OSError):
+    except (TimeoutError, ConnectionRefusedError, OSError):
         return None
 
 
-def probe_service(
-    ip: str, port: int, timeout: Optional[float] = None
-) -> Optional[str]:
+def probe_service(ip: str, port: int, timeout: Optional[float] = None) -> Optional[str]:
     """Identify what is listening on ``ip:port``, or ``None`` if closed."""
     effective_timeout = DEFAULT_PORT_TIMEOUT if timeout is None else timeout
 
@@ -209,9 +225,7 @@ class ServiceIdentifier:
         self.http_timeout = http_timeout
 
     # -- public --------------------------------------------------------
-    def identify(
-        self, banner: Optional[str], port: int, ip: Optional[str] = None
-    ) -> Optional[str]:
+    def identify(self, banner: Optional[str], port: int, ip: Optional[str] = None) -> Optional[str]:
         if banner is None or (isinstance(banner, float) and pd.isnull(banner)):
             return None
         if not banner:
@@ -322,16 +336,12 @@ class ServiceIdentifier:
         if not self.deep_probe:
             return False
 
-        _status, _headers, body = _http_get(
-            ip, port, path="/api/status", timeout=self.http_timeout
-        )
+        _status, _headers, body = _http_get(ip, port, path="/api/status", timeout=self.http_timeout)
         parsed = self._load_json(body)
         if isinstance(parsed, dict) and "kernels" in parsed and "sessions" in parsed:
             return True
 
-        _status, _headers, body = _http_get(
-            ip, port, path="/api", timeout=self.http_timeout
-        )
+        _status, _headers, body = _http_get(ip, port, path="/api", timeout=self.http_timeout)
         if body:
             body_lower = body.lower()
             if "jupyter server" in body_lower or '"version"' in body_lower:
@@ -340,10 +350,7 @@ class ServiceIdentifier:
             if isinstance(parsed, dict) and ("version" in parsed or "app" in parsed):
                 return True
 
-        if "302" in banner and ("/lab" in lower or "/tree" in lower):
-            return True
-
-        return False
+        return "302" in banner and ("/lab" in lower or "/tree" in lower)
 
     def _has_models(self, ip: str, port: int, path: str) -> bool:
         _status, _headers, body = _http_get(ip, port, path=path, timeout=self.http_timeout)

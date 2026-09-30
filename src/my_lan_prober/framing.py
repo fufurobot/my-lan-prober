@@ -48,7 +48,11 @@ class Framing(ABC):
         return payload
 
     def reset(self) -> None:
-        """Drop per-stream state."""
+        """Drop per-stream state.
+
+        Most strategies are stateless — ``frame()`` keeps any partial message
+        in the caller's buffer — so the default is intentionally empty.
+        """
 
 
 class StreamFraming(Framing):
@@ -121,9 +125,7 @@ class LengthPrefixFraming(Framing):
         return out
 
     def encode(self, payload: bytes) -> bytes:
-        prefix = len(payload).to_bytes(
-            self.prefix_bytes, "big" if self.big_endian else "little"
-        )
+        prefix = len(payload).to_bytes(self.prefix_bytes, "big" if self.big_endian else "little")
         header = bytearray(self.header_bytes)
         header[self.prefix_offset : self.prefix_offset + self.prefix_bytes] = prefix
         return bytes(header) + payload
@@ -265,8 +267,10 @@ class RequestResponseFraming(Framing):
                     return int(value.strip())
                 except ValueError:
                     return None
-        # No Content-Length: a request has no body, a response runs to close.
-        return None if not self._is_response(head) else None
+        # No Content-Length: a message with no declared length runs until the
+        # peer closes, which this framer cannot know — so treat it as complete
+        # at the header terminator.
+        return None
 
     @staticmethod
     def _is_response(head: bytes) -> bool:
@@ -302,9 +306,4 @@ class MultiplexFraming(Framing):
         return out
 
     def encode(self, payload: bytes) -> bytes:
-        return (
-            len(payload).to_bytes(3, "big")
-            + b"\x00\x00"
-            + (0).to_bytes(4, "big")
-            + payload
-        )
+        return len(payload).to_bytes(3, "big") + b"\x00\x00" + (0).to_bytes(4, "big") + payload

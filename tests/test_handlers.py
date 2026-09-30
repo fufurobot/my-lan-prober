@@ -16,12 +16,11 @@ from my_lan_prober.handlers import (
     ContextfulHandler,
     Handler,
     HandlerChain,
-    HandlerDispatcher,
     RegexBannerHandler,
     ScanResult,
     SocketBannerHandler,
 )
-from my_lan_prober.layers import LAYERS, LayerSpec, SessionRegistry
+from my_lan_prober.layers import LAYERS
 from my_lan_prober.sessions import AsyncSession, TableSession
 
 
@@ -189,9 +188,7 @@ def test_chain_returns_the_first_non_none_result():
 
 
 def test_chain_returns_none_when_nothing_matches():
-    chain = RegexBannerHandler(r"^SSH-", name="SSH") << RegexBannerHandler(
-        r"^HTTP/", name="HTTP"
-    )
+    chain = RegexBannerHandler(r"^SSH-", name="SSH") << RegexBannerHandler(r"^HTTP/", name="HTTP")
 
     assert chain.handle("10.0.0.1", port=22, banner=b"gibberish") is None
 
@@ -230,7 +227,7 @@ def make_socket_handler(replies=None, stack=None, children=None, persistor=None)
 
 
 def test_socket_handler_probes_and_returns_a_result():
-    handler, root = make_socket_handler(replies=[b"SSH-2.0-OpenSSH_10.5\r\n"])
+    handler, _root = make_socket_handler(replies=[b"SSH-2.0-OpenSSH_10.5\r\n"])
 
     result = handler.handle("10.0.0.1", port=22)
 
@@ -240,9 +237,7 @@ def test_socket_handler_probes_and_returns_a_result():
 
 def test_socket_handler_dispatches_to_a_matching_child():
     child = RegexBannerHandler(r"^SSH-", name="SSH")
-    handler, _ = make_socket_handler(
-        replies=[b"SSH-2.0-OpenSSH_10.5\r\n"], children=[child]
-    )
+    handler, _ = make_socket_handler(replies=[b"SSH-2.0-OpenSSH_10.5\r\n"], children=[child])
 
     result = handler.handle("10.0.0.1", port=22)
 
@@ -258,9 +253,7 @@ def test_socket_handler_description_names_the_stack():
 def test_socket_handler_rebinds_to_a_deeper_stack_in_place():
     """A child needing more layers must upgrade the live session."""
     child = RegexBannerHandler(r"^SSH-", name="SSH", stack=["TCP", "SSH"])
-    handler, root = make_socket_handler(
-        replies=[b"SSH-2.0-OpenSSH_10.5\r\n"], children=[child]
-    )
+    handler, root = make_socket_handler(replies=[b"SSH-2.0-OpenSSH_10.5\r\n"], children=[child])
 
     handler.handle("10.0.0.1", port=22)
 
@@ -282,9 +275,7 @@ def test_socket_handler_upgrade_keeps_the_persistor_at_the_top():
 
 def test_socket_handler_persists_parsed_packets():
     persistor = _RecordingPersistor()
-    handler, _ = make_socket_handler(
-        replies=[b"SSH-2.0-OpenSSH_10.5\r\n"], persistor=persistor
-    )
+    handler, _ = make_socket_handler(replies=[b"SSH-2.0-OpenSSH_10.5\r\n"], persistor=persistor)
 
     handler.handle("10.0.0.1", port=22)
 

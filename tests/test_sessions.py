@@ -16,8 +16,8 @@ import threading
 
 import pytest
 
+from my_lan_prober.framing import DelimiterFraming
 from my_lan_prober.layers import LAYERS, LayerSpec
-from my_lan_prober.framing import DelimiterFraming, LengthPrefixFraming
 from my_lan_prober.sessions import (
     AsyncSession,
     AsyncSocketSession,

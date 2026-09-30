@@ -183,9 +183,7 @@ def parse_windows_arp(output: Any) -> pd.DataFrame:
         mac = normalise_mac(mac)
         if entry_type.lower() != "dynamic" or not _is_usable_host(ip, mac):
             continue
-        rows.append(
-            {"ip": ip, "mac_address": mac, "mode": "arp", "interface": interface}
-        )
+        rows.append({"ip": ip, "mac_address": mac, "mode": "arp", "interface": interface})
     return _frame(rows)
 
 
@@ -206,9 +204,7 @@ def parse_proc_net_arp(output: Any) -> pd.DataFrame:
         mac = normalise_mac(mac)
         if not _is_usable_host(ip, mac):
             continue
-        rows.append(
-            {"ip": ip, "mac_address": mac, "mode": "arp", "interface": device}
-        )
+        rows.append({"ip": ip, "mac_address": mac, "mode": "arp", "interface": device})
     return _frame(rows)
 
 
@@ -452,9 +448,7 @@ class PlaywrightFetcher(ARPTableFetcher):
             frame = _parse_lease_table(Path(path).read_text(encoding="utf-8"))
 
         frame = frame.iloc[1:, :].reset_index(drop=True)
-        frame.columns = ["host", "mac_address", "ip_address", "valid_time"][
-            : len(frame.columns)
-        ]
+        frame.columns = ["host", "mac_address", "ip_address", "valid_time"][: len(frame.columns)]
         frame["mac_address"] = frame["mac_address"].map(normalise_mac)
         frame["mode"] = "dhcp"
         frame["ip"] = frame["ip_address"]
@@ -515,9 +509,7 @@ class OpenWRTFetcher(ARPTableFetcher):
 
     def iptable(self) -> pd.DataFrame:
         if not self.host:
-            raise RuntimeError(
-                "OpenWRTFetcher needs a host (constructor arg or OPENWRT_HOST)"
-            )
+            raise RuntimeError("OpenWRTFetcher needs a host (constructor arg or OPENWRT_HOST)")
         import asyncssh
 
         result = asyncssh.run(
@@ -544,17 +536,17 @@ class FetcherChain(ARPTableFetcher):
         return list(self._fetchers)
 
     def __rshift__(self, other: ARPTableFetcher) -> "FetcherChain":
-        return FetcherChain(self._fetchers + [other])
+        return FetcherChain([*self._fetchers, other])
 
     def __lshift__(self, other: ARPTableFetcher) -> "FetcherChain":
-        return FetcherChain([other] + self._fetchers)
+        return FetcherChain([other, *self._fetchers])
 
     def iptable(self) -> pd.DataFrame:
         errors: List[str] = []
         for fetcher in self._fetchers:
             try:
                 frame = self._validate(fetcher.iptable())
-            except Exception as exc:  # noqa: BLE001 - fall through to the next
+            except Exception as exc:
                 errors.append(f"{type(fetcher).__name__}: {exc}")
                 log.warning("ARP source %s failed: %s", type(fetcher).__name__, exc)
                 continue

@@ -193,7 +193,7 @@ class JSONLPersistor(_InMemoryPersistor):
         with self._lock:
             self._rows = {}
             self._columns = []
-        with open(target, "r", encoding="utf-8") as handle:
+        with open(target, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
@@ -273,9 +273,7 @@ class SQLitePersistor(_InMemoryPersistor):
             return
         self._ensure_schema()
         with self._connect() as conn:
-            cursor = conn.execute(
-                "SELECT record_id, column_name, value FROM records"
-            )
+            cursor = conn.execute("SELECT record_id, column_name, value FROM records")
             fetched = cursor.fetchall()
         with self._lock:
             self._rows = {}
@@ -316,6 +314,4 @@ class ArrowPlasmaPersistor(_InMemoryPersistor):
             self._columns = list(frame.columns)
             for _, row in frame.iterrows():
                 record_id = uuid.uuid4().hex
-                self._rows[record_id] = {
-                    column: row[column] for column in frame.columns
-                }
+                self._rows[record_id] = {column: row[column] for column in frame.columns}

@@ -57,6 +57,29 @@ asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
 addopts = "-q --strict-markers -p no:cacheprovider"
 
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    # The dataclass-style Optional[...] annotations read better than X | None
+    # in the LayerSpec table, where every field is documented.
+    "UP045",
+    "UP006",
+    "UP035",
+    "UP037",
+    "RUF022",
+    # LayerSpec.reset/framing defaults are deliberately empty no-ops.
+    "B027",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately use broad asserts, long literal fixtures, and blind excepts.
+"tests/*" = ["BLE001", "B017", "E501", "SIM"]
+
 [dependency-groups]
 dev = [
     "mypy>=2.3.1",

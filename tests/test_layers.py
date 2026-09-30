@@ -94,8 +94,15 @@ def test_layer_names_match_their_dict_keys():
 
 
 def test_every_layer_has_a_ports_hint_or_is_a_pure_shim():
-    """Roots and application protocols advertise ports; pure shims need not."""
-    shims = {"HTTP CONNECT", "ICE", "WebRTC", "GSSAPI", "EAP", "WSS", "SFTP", "SCP"}
+    """Roots and application protocols advertise ports; pure shims need not.
+
+    Media layers (RTP/SRTP/ZRTP/RTCP) are carried on ports negotiated by a
+    signalling protocol, so they have no well-known port of their own.
+    """
+    shims = {
+        "HTTP CONNECT", "ICE", "WebRTC", "GSSAPI", "EAP", "WSS", "SFTP", "SCP",
+        "RTP", "SRTP", "ZRTP", "RTCP",
+    }
 
     for name, spec in LAYERS.items():
         if name in shims:

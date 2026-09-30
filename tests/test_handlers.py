@@ -7,6 +7,8 @@ parent upgrades the *live* session in place instead of reconnecting.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from my_lan_prober.handlers import (
@@ -144,10 +146,15 @@ def test_iadd_accepts_a_child_that_survives_the_empty_banner_smoke_test():
     assert parent.children() == [child]
 
 
-def test_regex_handler_rejects_a_broken_pattern_via_check_banner():
-    handler = RegexBannerHandler(r"(", name="Broken")
+def test_regex_handler_rejects_an_invalid_pattern_at_construction():
+    with pytest.raises(re.error):
+        RegexBannerHandler(r"(", name="Broken")
 
-    assert handler.check_banner(b"anything") is False
+
+def test_regex_handler_check_banner_never_raises_on_odd_input():
+    handler = RegexBannerHandler(r"^SSH-", name="SSH")
+
+    assert handler.check_banner(b"\xff\xfe invalid utf-8") is False
 
 
 def test_regex_handler_accepts_a_compiled_pattern():

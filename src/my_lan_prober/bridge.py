@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 __all__ = ["AsyncBridge", "default_bridge"]
 
@@ -119,6 +119,15 @@ class AsyncBridge:
         if "error" in box:
             raise box["error"]
         return box.get("value")
+
+    @staticmethod
+    async def run_sync(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Await a *blocking* callable without stalling the bridge's loop.
+
+        Used to run sync handlers from async code (``Handler.ahandle``).
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
 
 _default: Optional[AsyncBridge] = None

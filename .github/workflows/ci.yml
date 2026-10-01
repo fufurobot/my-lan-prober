@@ -93,15 +93,27 @@ jobs:
       # `asyncssh` and friends are extras, and a bare `uv sync` is what a
       # contributor and CI both get. Guard against a module-level import of an
       # optional dependency sneaking back in.
+      #
+      # This runs in its own isolated environment built from the project
+      # (`--with .` pulls core dependencies only), so it depends on the
+      # package metadata alone rather than on whatever earlier steps left in
+      # the job's venv.
+      #
+      # `shell: bash` is explicit because windows-latest defaults to
+      # PowerShell, where `set -euo pipefail` is not a valid command.
       - name: Run tests without optional extras
+        shell: bash
         run: |
           set -euo pipefail
-          uv run --no-dev python -c "
+          uv run --isolated --no-project --with pytest --with pytest-asyncio --with . \
+            python -c "
           import importlib.util as u
-          for extra in ('playwright', 'asyncssh', 'openai', 'zeroconf'):
+          for extra in ('playwright', 'asyncssh', 'openai', 'zeroconf', 'pyarrow'):
               assert u.find_spec(extra) is None, f'{extra} unexpectedly installed'
+          print('optional extras confirmed absent')
           "
-          uv run pytest tests/test_smoke.py -q
+          uv run --isolated --no-project --with pytest --with pytest-asyncio --with . \
+            pytest tests/test_smoke.py -q -rs
 
       # The smoke tests are the ones that caught the MSYS2/`os.tmpdir()`
       # Playwright failure; they are worth surfacing separately rather than
@@ -132,16 +144,18 @@ jobs:
       # neighbours. Unshare the network namespace so any test that reaches out
       # fails the build loudly.
       #
-      # `uv` must be resolved to an absolute path: inside the new namespace the
-      # inherited PATH does not find the shim, which fails with
-      # "unshare: failed to execute uv: No such file or directory".
+      # Two details this needs to get right:
+      #   * `uv` must be an absolute path — inside the new namespace the
+      #     inherited PATH does not find the shim ("failed to execute uv");
+      #   * no `--map-root-user`: it rewrites the uid and the runner user then
+      #     cannot read its own uv cache ("failed to open ... uv.toml").
+      # `sudo -E` keeps PATH and the uv cache/home variables intact.
       - name: Run tests with network access blocked
         run: |
           set -euo pipefail
           UV_BIN="$(command -v uv)"
           echo "uv: ${UV_BIN}"
-          sudo --preserve-env=PATH unshare --net --map-root-user \
-            "${UV_BIN}" run --no-sync pytest -q
+          sudo -E unshare --net "${UV_BIN}" run --no-sync pytest -q
 
   build:
     name: Build distribution

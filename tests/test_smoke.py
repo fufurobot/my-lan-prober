@@ -160,15 +160,22 @@ def test_driver_env_sets_all_three_variables_consistently():
     assert env["TMPDIR"] == env["TMP"] == env["TEMP"]
 
 
-def test_driver_env_overrides_an_unusable_inherited_value(monkeypatch, tmp_path):
-    """The MSYS2 case: an inherited POSIX TMPDIR must not win."""
-    monkeypatch.setenv("TMPDIR", "/tmp")
-    monkeypatch.setenv("TMP", "/tmp")
-    monkeypatch.setenv("TEMP", "/tmp")
+def test_driver_env_overrides_an_unusable_inherited_value(monkeypatch):
+    """The MSYS2 case: an inherited temp dir that cannot be written must lose.
+
+    The unusable path is constructed rather than hardcoded: ``/tmp`` is a
+    perfectly good temp directory on Linux (where CI runs part of the matrix),
+    so asserting ``!= "/tmp"`` would be asserting a Windows-only accident.
+    """
+    unusable = Path("/nonexistent-temp-for-my-lan-prober")
+    assert not _tmpdir_is_writable(unusable), "precondition: path must be unusable"
+    monkeypatch.setenv("TMPDIR", str(unusable))
+    monkeypatch.setenv("TMP", str(unusable))
+    monkeypatch.setenv("TEMP", str(unusable))
 
     env = PlaywrightFetcher.driver_env()
 
-    assert env["TMPDIR"] != "/tmp"
+    assert Path(env["TMPDIR"]) != unusable
     assert _tmpdir_is_writable(Path(env["TMPDIR"]))
 
 

@@ -32,7 +32,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -59,24 +58,10 @@ def _tmpdir_is_writable(path: Path) -> bool:
     """Whether a file can really be created in ``path``.
 
     Deliberately not ``os.access``: on Windows that reports ``True`` for the
-    very directory whose writes fail with ``EPERM``.
+    very directory whose writes fail with ``EPERM``.  Bounded by a timeout
+    because a wedged directory can block the create instead of failing it.
     """
-    if not path.is_dir():
-        return False
-    probe = None
-    try:
-        fd, name = tempfile.mkstemp(dir=str(path), prefix=".writable-probe-")
-        probe = name
-        os.close(fd)
-    except OSError:
-        return False
-    finally:
-        if probe is not None:
-            try:
-                os.unlink(probe)
-            except OSError:
-                pass
-    return True
+    return PlaywrightFetcher.temp_dir_is_usable(path)
 
 
 # ---------------------------------------------------------------------------
@@ -195,22 +180,30 @@ def test_driver_env_preserves_the_rest_of_the_environment(monkeypatch):
 
 
 def test_driver_env_finds_a_fallback_when_every_candidate_is_bad(monkeypatch, tmp_path):
-    """Even with all candidates poisoned, a writable dir must be produced."""
+    """Even with all candidates poisoned, a writable dir must be produced.
+
+    The fallback must be our own scratch directory, never the project root:
+    ``tempfile.gettempdir()`` returns the current directory when everything
+    else fails, and accepting that would litter the workspace with browser
+    artifacts.
+    """
     monkeypatch.setenv("TMPDIR", "/nope")
     monkeypatch.setenv("TMP", "/nope")
     monkeypatch.setenv("TEMP", "/nope")
+    monkeypatch.setenv("LOCALAPPDATA", "/nope")
+    monkeypatch.setenv("SYSTEMROOT", "/nope")
 
     env = PlaywrightFetcher.driver_env()
 
-    assert _tmpdir_is_writable(Path(env["TMPDIR"]))
+    chosen = Path(env["TMPDIR"])
+    assert _tmpdir_is_writable(chosen)
+    assert chosen.name == ".tmp"
 
 
 # ---------------------------------------------------------------------------
 # End-to-end: the driver really can make an artifacts dir
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(
-    not _node_exe().exists(), reason="playwright driver node.exe is not installed"
-)
+@pytest.mark.skipif(not _node_exe().exists(), reason="playwright driver node.exe is not installed")
 def test_node_can_mkdtemp_an_artifacts_dir_with_the_provided_env(monkeypatch):
     """Run the driver's exact mkdtemp call under the env we hand it."""
     monkeypatch.setenv("TMPDIR", "/tmp")

@@ -369,6 +369,51 @@ ssh \
     192.168.1.104
 ```
 
+## Environment notes
+
+### `EPERM ... mkdtemp 'C:\...\msys64\tmp\playwright-artifacts-XXXXXX'`
+
+Seen when running `my-lan-prober` from a real MSYS2 shell (any `MSYSTEM`), and
+after switching the project interpreter from a Store/`microsoft-apps` Python
+to a uv-managed one.
+
+Playwright launches its Node driver, and the driver picks its artifacts
+directory with `os.tmpdir()`, which honours `TMPDIR` → `TMP` → `TEMP` **in
+that order and without a fallback**. An MSYS2 shell exports those as its own
+`/tmp`, which a native Windows process cannot write to.
+
+CPython behaves differently: `tempfile._get_default_tempdir` probes each
+candidate by actually creating a file and silently moves on when one fails,
+so `tempfile.gettempdir()` still returns a usable directory. That asymmetry is
+why the failure looks confusing — Python's own temp handling is healthy while
+the browser subprocess dies.
+
+`PlaywrightFetcher.driver_env()` resolves a genuinely writable directory and
+sets all three variables to it for the driver, so the launch succeeds:
+
+```python
+from my_lan_prober.fetchers import PlaywrightFetcher, _driver_env_applied
+
+with _driver_env_applied(PlaywrightFetcher.driver_env()):
+    ...  # launch Playwright here
+```
+
+Two details worth knowing:
+
+- Writability is tested by creating a real file, never with `os.access` — on
+  Windows that reports `True` for directories whose writes fail with `EPERM`.
+- The probe is bounded by a timeout, because a wedged `%LOCALAPPDATA%\Temp`
+  *blocks* the create instead of failing it. Such a directory is skipped with
+  a warning.
+
+If every candidate is unusable, the driver is pointed at `data/.tmp`, which
+the project owns. The current directory is never used: `tempfile.gettempdir()`
+returns the cwd as a last resort, and accepting that would drop browser
+artifacts into your source tree.
+
+Run `uv run pytest tests/test_smoke.py` to check these invariants on your
+machine.
+
 ## Design notes
 
 - **`Session` is transport-only.** `send` / `read` move bytes; the persistor is

@@ -225,3 +225,4 @@ data
 .pytest_cache
 pytest-cache-files-*
 .pytest-tmp
+data/.tmp

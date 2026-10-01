@@ -11,14 +11,18 @@ keeps the platform-specific formats testable without touching a live network.
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import logging
+import os
 import platform
 import re
 import subprocess
+import tempfile
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -384,10 +388,128 @@ class PlaywrightFetcher(ARPTableFetcher):
     USER_DATA_DIR = Path(".playwright-user-data")
     #: HTML dump written for debugging / offline re-parsing.
     HTML_DUMP = Path("data") / "tplogin-arp.html"
+    #: Temp vars the Node driver reads, in its own priority order.
+    TEMP_VARS = ("TMPDIR", "TMP", "TEMP")
 
     def __init__(self, password: Optional[str] = None, *, headless: bool = False) -> None:
         self.password = password
         self.headless = headless
+
+    # -- temp directory handling ---------------------------------------
+    @staticmethod
+    def temp_dir_is_usable(path: Any, timeout: float = 2.0) -> bool:
+        """Whether a file can really be created in ``path``, quickly.
+
+        ``os.access(..., W_OK)`` is not enough on Windows: it reports ``True``
+        for directories whose writes fail with ``EPERM``.  Only an actual
+        create tells the truth.
+
+        The probe runs in a worker thread with a timeout because a wedged
+        ``%LOCALAPPDATA%\\Temp`` can block the create indefinitely rather than
+        failing — a hang that would otherwise stall the whole scan.
+        """
+        directory = Path(path)
+        try:
+            if not directory.is_dir():
+                return False
+        except OSError:
+            return False
+
+        result: Dict[str, bool] = {}
+
+        def probe() -> None:
+            handle = None
+            name = None
+            try:
+                handle, name = tempfile.mkstemp(dir=str(directory), prefix=".probe-")
+                result["ok"] = True
+            except OSError:
+                result["ok"] = False
+            finally:
+                if handle is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(handle)
+                if name is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(name)
+
+        worker = threading.Thread(target=probe, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            # Wedged: treat as unusable and move on.  The thread is a daemon
+            # so a stuck filesystem call cannot keep the process alive.
+            log.warning("temp directory %s did not respond within %.1fs", directory, timeout)
+            return False
+        return result.get("ok", False)
+
+    @classmethod
+    def resolve_driver_temp_dir(cls) -> Path:
+        """First writable temp directory, in the driver's own priority order.
+
+        An MSYS2 shell exports ``TMPDIR`` as its own ``/tmp``, which a native
+        Windows process cannot use.  CPython's ``tempfile`` probes candidates
+        and silently falls through; the Node driver does not, so we do the
+        probing for it.
+
+        The inherited values are tried verbatim first — re-deriving a path
+        from ``%LOCALAPPDATA%`` would be a downgrade here, because the store
+        Python and the MSYS2 toolchain can both leave ``AppData\\Local\\Temp``
+        itself wedged while an inherited subdirectory of it works fine.
+
+        ``tempfile.gettempdir()`` is deliberately *not* used as a candidate:
+        when every real candidate fails it returns the current directory, so
+        accepting it would silently drop browser artifacts into the project.
+        """
+        candidates: List[Path] = []
+        for name in cls.TEMP_VARS:
+            raw = os.environ.get(name, "").strip()
+            if raw:
+                candidates.append(Path(raw))
+
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "Temp")
+        system_root = os.environ.get("SYSTEMROOT", "").strip()
+        if system_root:
+            candidates.append(Path(system_root) / "Temp")
+
+        # Our own scratch directory, created on demand.
+        fallback = Path("data") / ".tmp"
+        candidates.append(fallback)
+
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate == fallback:
+                try:
+                    fallback.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    continue
+            if cls.temp_dir_is_usable(candidate):
+                return candidate.resolve()
+
+        raise RuntimeError(
+            "no writable temp directory found for the Playwright driver; "
+            f"tried: {', '.join(str(c) for c in candidates)}"
+        )
+
+    @classmethod
+    def driver_env(cls) -> Dict[str, str]:
+        """Environment for the Playwright Node driver.
+
+        Sets every temp variable the driver consults to the same writable
+        directory, so ``os.tmpdir()`` cannot land on an unusable inherited
+        value.
+        """
+        env = dict(os.environ)
+        chosen = str(cls.resolve_driver_temp_dir())
+        for name in cls.TEMP_VARS:
+            env[name] = chosen
+        return env
 
     def run(self, context: Any, password: str) -> Any:  # pragma: no cover - abstract
         """Drive the page and return the scraped HTML."""
@@ -416,7 +538,11 @@ class PlaywrightFetcher(ARPTableFetcher):
         password = self.get_password()
         self.HTML_DUMP.parent.mkdir(parents=True, exist_ok=True)
 
-        with sync_playwright() as playwright:
+        # Playwright's Node driver picks its artifacts directory with
+        # os.tmpdir(), which honours TMPDIR/TMP/TEMP with no fallback.  Hand
+        # it an env whose temp dir is known to be writable, or the browser
+        # launch dies with EPERM before it ever starts.
+        with _driver_env_applied(self.driver_env()), sync_playwright() as playwright:
             browser = getattr(playwright, self._browser_name()).launch(headless=self.headless)
             context = browser.new_context()
             try:
@@ -562,3 +688,25 @@ class FetcherChain(ARPTableFetcher):
 def default_fetcher_chain() -> FetcherChain:
     """TP-Link first, then whichever local ARP table this OS provides."""
     return FetcherChain([TPLoginFetcher(), UnixArpFetcher(), WindowsArpFetcher()])
+
+
+@contextlib.contextmanager
+def _driver_env_applied(env: Dict[str, str]):
+    """Apply ``env`` to the process for the duration of the block.
+
+    Playwright's ``sync_playwright()`` spawns its driver as a child process,
+    so the temp variables must be in ``os.environ`` when the driver starts.
+    They are restored afterwards so we do not leak an overridden temp dir to
+    the rest of the scan (``icmp_ping`` and the port probes start
+    subprocesses too).
+    """
+    saved = {name: os.environ.get(name) for name in env}
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value

@@ -141,21 +141,39 @@ jobs:
 
       # A scanning tool's suite passing on a machine with a LAN would be a
       # false positive: DNS, ICMP and port probes all "succeed" against real
-      # neighbours. Unshare the network namespace so any test that reaches out
-      # fails the build loudly.
+      # neighbours. Unshare the network namespace so a test that reaches out
+      # to the LAN fails the build loudly.
       #
-      # Two details this needs to get right:
-      #   * `uv` must be an absolute path — inside the new namespace the
-      #     inherited PATH does not find the shim ("failed to execute uv");
+      # A fresh network namespace has no usable interfaces, not even loopback,
+      # so tests using 127.0.0.1 or socketpair() — genuinely local, and
+      # legitimate — would die with "Network is unreachable". Bringing `lo` up
+      # restores exactly those while leaving every route off-host gone.
+      #
+      # `lo` is brought up best-effort: if `ip` is unavailable the run still
+      # executes, and the localhost tests fail loudly enough to be noticed
+      # rather than the whole step erroring out on a missing tool.
+      #
+      # Two more details:
+      #   * `uv` must be an absolute path — inside the namespace the inherited
+      #     PATH does not find the shim ("failed to execute uv");
       #   * no `--map-root-user`: it rewrites the uid and the runner user then
-      #     cannot read its own uv cache ("failed to open ... uv.toml").
+      #     cannot read its own uv cache ("failed to open uv.toml").
       # `sudo -E` keeps PATH and the uv cache/home variables intact.
       - name: Run tests with network access blocked
         run: |
           set -euo pipefail
           UV_BIN="$(command -v uv)"
           echo "uv: ${UV_BIN}"
-          sudo -E unshare --net "${UV_BIN}" run --no-sync pytest -q
+          sudo -E unshare --net bash -c '
+            set -uo pipefail
+            if command -v ip >/dev/null 2>&1; then
+              ip link set lo up || echo "warning: could not bring lo up"
+              ip -brief addr show || true
+            else
+              echo "warning: iproute2 not found; loopback may be unavailable"
+            fi
+            exec "$0" run --no-sync pytest -q
+          ' "${UV_BIN}"
 
   build:
     name: Build distribution

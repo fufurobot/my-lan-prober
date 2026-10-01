@@ -234,5 +234,7 @@ build/
 
 # Local CI debugging helpers (they read GITHUB_TOKEN from .env)
 .ci_logs.py
+.ci_logs_api.py
+.ci_watch.py
 .ci-log-*.txt
 .ci-venv

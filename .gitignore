@@ -231,3 +231,8 @@ data/.tmp
 dist/
 build/
 .ci-sshkey
+
+# Local CI debugging helpers (they read GITHUB_TOKEN from .env)
+.ci_logs.py
+.ci-log-*.txt
+.ci-venv

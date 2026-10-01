@@ -89,6 +89,20 @@ jobs:
       - name: Run tests
         run: uv run pytest -q
 
+      # The suite must pass without any optional extra installed: `playwright`,
+      # `asyncssh` and friends are extras, and a bare `uv sync` is what a
+      # contributor and CI both get. Guard against a module-level import of an
+      # optional dependency sneaking back in.
+      - name: Run tests without optional extras
+        run: |
+          set -euo pipefail
+          uv run --no-dev python -c "
+          import importlib.util as u
+          for extra in ('playwright', 'asyncssh', 'openai', 'zeroconf'):
+              assert u.find_spec(extra) is None, f'{extra} unexpectedly installed'
+          "
+          uv run pytest tests/test_smoke.py -q
+
       # The smoke tests are the ones that caught the MSYS2/`os.tmpdir()`
       # Playwright failure; they are worth surfacing separately rather than
       # being buried in the aggregate count.
@@ -117,8 +131,17 @@ jobs:
       # false positive: DNS, ICMP and port probes all "succeed" against real
       # neighbours. Unshare the network namespace so any test that reaches out
       # fails the build loudly.
+      #
+      # `uv` must be resolved to an absolute path: inside the new namespace the
+      # inherited PATH does not find the shim, which fails with
+      # "unshare: failed to execute uv: No such file or directory".
       - name: Run tests with network access blocked
-        run: sudo unshare --net --map-root-user uv run --no-sync pytest -q
+        run: |
+          set -euo pipefail
+          UV_BIN="$(command -v uv)"
+          echo "uv: ${UV_BIN}"
+          sudo --preserve-env=PATH unshare --net --map-root-user \
+            "${UV_BIN}" run --no-sync pytest -q
 
   build:
     name: Build distribution

@@ -43,15 +43,29 @@ from my_lan_prober.fetchers import PlaywrightFetcher
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _playwright_driver_dir() -> Path:
-    """Directory holding Playwright's bundled ``node.exe``."""
-    import playwright
+def _playwright_driver_dir() -> Path | None:
+    """Directory holding Playwright's bundled ``node.exe``, or ``None``.
 
+    ``playwright`` is an optional extra, so a plain ``uv sync`` in CI does not
+    install it.  Importing it at module scope would crash collection before
+    any ``skipif`` could run — which is exactly what happened on the first CI
+    run — so the import is guarded and callers treat ``None`` as "not
+    installed".
+    """
+    try:
+        import playwright
+    except ImportError:
+        return None
     return Path(playwright.__file__).parent / "driver"
 
 
-def _node_exe() -> Path:
-    return _playwright_driver_dir() / "node.exe"
+def _node_exe() -> Path | None:
+    """The driver's ``node.exe``, or ``None`` when Playwright is absent."""
+    driver = _playwright_driver_dir()
+    if driver is None:
+        return None
+    node = driver / "node.exe"
+    return node if node.exists() else None
 
 
 def _tmpdir_is_writable(path: Path) -> bool:
@@ -106,8 +120,8 @@ def test_driver_temp_dir_resolution_matches_python():
     subprocess dies — the confusing half-broken symptom from the traceback.
     """
     node = _node_exe()
-    if not node.exists():
-        pytest.skip("playwright driver node.exe is not installed")
+    if node is None:
+        pytest.skip("playwright is not installed (optional extra)")
 
     result = subprocess.run(
         [str(node), "-e", "process.stdout.write(require('os').tmpdir())"],
@@ -203,9 +217,12 @@ def test_driver_env_finds_a_fallback_when_every_candidate_is_bad(monkeypatch, tm
 # ---------------------------------------------------------------------------
 # End-to-end: the driver really can make an artifacts dir
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(not _node_exe().exists(), reason="playwright driver node.exe is not installed")
 def test_node_can_mkdtemp_an_artifacts_dir_with_the_provided_env(monkeypatch):
     """Run the driver's exact mkdtemp call under the env we hand it."""
+    node = _node_exe()
+    if node is None:
+        pytest.skip("playwright is not installed (optional extra)")
+
     monkeypatch.setenv("TMPDIR", "/tmp")
     monkeypatch.setenv("TMP", "/tmp")
     monkeypatch.setenv("TEMP", "/tmp")
@@ -218,7 +235,7 @@ def test_node_can_mkdtemp_an_artifacts_dir_with_the_provided_env(monkeypatch):
     )
 
     result = subprocess.run(
-        [str(_node_exe()), "-e", script],
+        [str(node), "-e", script],
         capture_output=True,
         text=True,
         timeout=60,

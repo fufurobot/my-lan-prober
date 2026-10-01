@@ -226,3 +226,8 @@ data
 pytest-cache-files-*
 .pytest-tmp
 data/.tmp
+
+# Build outputs
+dist/
+build/
+.ci-sshkey

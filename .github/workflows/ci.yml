@@ -1,0 +1,155 @@
+name: CI
+
+# The interesting cases for this project are not "does it import" but:
+#   * the suite is hermetic — it must never touch the network, because the
+#     tool's whole job is to scan a LAN and a CI runner has no LAN to scan;
+#   * the framing/persistor logic is platform-sensitive (Windows path and
+#     ACL behaviour has already produced one real bug);
+#   * `uv.lock` is gitignored, so dependency resolution happens fresh here.
+# NOTE: `on` is quoted because unquoted it is parsed as the boolean true by
+# YAML 1.1 loaders (GitHub Actions itself is fine either way, but local
+# validators and linters otherwise see a key named `True`).
+"on":
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel a run that a newer push to the same ref supersedes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Keep uv's output stable and non-interactive in CI.
+  UV_NO_PROGRESS: "1"
+  UV_PRERELEASE: "disallow"
+  PYTHONUTF8: "1"
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Set up Python
+        run: uv python install 3.10
+
+      # `dev` is a dependency-group, so it comes in with a plain sync.
+      - name: Sync dependencies
+        run: uv sync --python 3.10
+
+      - name: ruff format --check
+        run: uv run ruff format --check --diff src tests
+
+      - name: ruff check
+        run: uv run ruff check --output-format=github src tests
+
+  test:
+    name: Test (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor; 3.13 is what the project ran on before
+        # moving to uv-managed interpreters, so both ends are worth keeping.
+        # Windows runs the floor only: it is the platform where the real
+        # path/temp/ACL bugs appeared, and one leg there is enough coverage
+        # per push without doubling the slowest runner.
+        python: ["3.10", "3.13"]
+        os: [ubuntu-latest, windows-latest]
+        exclude:
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Sync dependencies
+        run: uv sync --python ${{ matrix.python }}
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      # The smoke tests are the ones that caught the MSYS2/`os.tmpdir()`
+      # Playwright failure; they are worth surfacing separately rather than
+      # being buried in the aggregate count.
+      - name: Run environment smoke tests
+        run: uv run pytest tests/test_smoke.py -v
+
+  hermetic:
+    name: Tests must not touch the network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      # Install first, with the network available — then cut the network and
+      # run. Doing both at once would fail on dependency download instead of
+      # on the behaviour we actually care about.
+      - name: Sync dependencies
+        run: uv sync --python 3.10
+
+      # A scanning tool's suite passing on a machine with a LAN would be a
+      # false positive: DNS, ICMP and port probes all "succeed" against real
+      # neighbours. Unshare the network namespace so any test that reaches out
+      # fails the build loudly.
+      - name: Run tests with network access blocked
+        run: sudo unshare --net --map-root-user uv run --no-sync pytest -q
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # Prove the console script is wired up and the package imports from the
+      # built artifact, not just from the checkout. Resolve the wheel path
+      # explicitly rather than relying on shell globbing.
+      - name: Smoke test the built wheel
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          echo "testing ${wheel}"
+          uv run --isolated --no-project --with "${wheel}" my-lan-prober --help
+          uv run --isolated --no-project --with "${wheel}" \
+            python -c "import my_lan_prober; print(my_lan_prober.__version__)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

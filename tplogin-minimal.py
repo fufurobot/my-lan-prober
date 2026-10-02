@@ -14,9 +14,18 @@ Port detection timeout (TCP connect phase) can be configured via:
   * Default: 0.1s (LAN probes should be near-instant)
 
 Precedence: CLI flag > environment variable > default.
+
+The router scrape needs a Playwright browser *binary*, which
+``pip install playwright`` does not install — the binaries come from a
+separate ``playwright install``.  The engine is therefore detected at run
+time (see :func:`first_available_browser`) instead of assuming chromium, and
+when no engine at all is available the scan falls back to the OS ARP table
+(see :func:`local_arp_leases`) so it still produces a useful result.
 """
 
 import argparse
+import contextlib
+import ipaddress
 import re
 import socket
 import subprocess
@@ -24,12 +33,18 @@ import platform
 import os
 import json
 import logging
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
 from tqdm.auto import tqdm
-from playwright.sync_api import Playwright, sync_playwright
+
+# ``playwright`` is imported lazily, inside the functions that need it.  A
+# module-level import would make this whole script unrunnable on a machine
+# without the (optional) package — which is exactly the situation the local
+# ARP fallback exists to handle.
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,6 +67,14 @@ PORT_SCAN_TIMEOUT: float = DEFAULT_PORT_TIMEOUT
 # Other timeouts (seconds)
 HTTP_TIMEOUT: int = 5
 PING_TIMEOUT: int = 2
+
+# Playwright's three engines, in order of preference.  Chromium leads because
+# it is what this script has always used, so a machine with several engines
+# installed keeps behaving exactly as before.
+BROWSER_NAMES: Tuple[str, ...] = ("chromium", "firefox", "webkit")
+
+# Command that downloads a missing browser binary.
+BROWSER_INSTALL_HINT: str = "playwright install"
 
 # ---------------------------------------------------------------------------
 # Output directory: everything goes under ./data
@@ -99,6 +122,20 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             f"Default: {DEFAULT_PORT_TIMEOUT}s. "
             "Can also be set via the PORT_TIMEOUT environment variable. "
             "CLI flag takes precedence over the env var."
+        ),
+    )
+    parser.add_argument(
+        "--browser",
+        choices=BROWSER_NAMES,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Playwright browser engine to use when scraping the router. "
+            "Default: auto-detect the first engine that is installed ("
+            + ", ".join(BROWSER_NAMES)
+            + "). Note that installing the Python package does not install a "
+            f"browser; run `{BROWSER_INSTALL_HINT}` for that. When no engine "
+            "is available at all, the scan falls back to the local ARP table."
         ),
     )
     return parser.parse_args(argv)
@@ -614,19 +651,452 @@ def get_password() -> str:
     return password
 
 
-def scrape_router_dhcp() -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Browser engine detection
+# ---------------------------------------------------------------------------
+
+class BrowserNotInstalled(RuntimeError):
+    """No usable Playwright browser binary was found on this machine."""
+
+
+def _driver_env() -> Dict[str, str]:
+    """
+    Environment for Playwright's Node driver, with a writable temp dir.
+
+    The driver picks its artifacts directory with ``os.tmpdir()``, which
+    honours ``TMPDIR`` -> ``TMP`` -> ``TEMP`` with no fallback of its own.  An
+    MSYS2 shell exports those as its own ``/tmp``, which a native Windows
+    process cannot write to, and the browser launch then dies with ``EPERM``
+    at ``mkdtemp`` (CPython 3.13) or ``WinError 5`` while creating the
+    driver's pipes (CPython 3.10).  CPython's own ``tempfile`` probes and
+    falls through, which is why the failure looks so confusing.
+
+    Writability is tested by creating a real file: ``os.access`` reports
+    ``True`` on Windows for directories whose writes fail.
+    """
+    candidates: List[Path] = []
+
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        raw = os.environ.get(name, "").strip()
+        # A POSIX-style path only exists inside MSYS2; a native Windows child
+        # cannot use one, so it is never a candidate there.
+        if raw and not (os.name == "nt" and raw.startswith("/")):
+            candidates.append(Path(raw))
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_appdata:
+        candidates.append(Path(local_appdata) / "Temp")
+
+    candidates.append(Path.cwd() / "playwright-temp")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if _temp_dir_is_writable(candidate):
+            chosen = str(candidate.resolve())
+            env = dict(os.environ)
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                env[name] = chosen
+            return env
+
+    return dict(os.environ)
+
+
+def _temp_dir_is_writable(path: Path, timeout: float = 2.0) -> bool:
+    """Whether a file can really be created in ``path``, bounded by a timeout.
+
+    The probe runs in a worker thread because a wedged ``%LOCALAPPDATA%\\Temp``
+    can *block* the create indefinitely rather than failing it.
+    """
+    result: Dict[str, bool] = {}
+
+    def probe() -> None:
+        handle = None
+        name = None
+        try:
+            if not path.is_dir():
+                result["ok"] = False
+                return
+            handle, name = tempfile.mkstemp(dir=str(path), prefix=".probe-")
+            result["ok"] = True
+        except OSError:
+            result["ok"] = False
+        finally:
+            if handle is not None:
+                with contextlib.suppress(OSError):
+                    os.close(handle)
+            if name is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(name)
+
+    worker = threading.Thread(target=probe, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        log.warning("temp directory %s did not respond within %.1fs", path, timeout)
+        return False
+    return result.get("ok", False)
+
+
+def is_browser_installed(browser_type: Any) -> bool:
+    """
+    Whether one Playwright ``BrowserType`` has a binary that exists on disk.
+
+    ``executable_path`` is ``""`` when Playwright has no binary for that
+    engine, and ``Path("")`` is the *current directory* — which exists — so
+    the emptiness check has to come first or every engine looks installed.
+    """
+    try:
+        raw = browser_type.executable_path
+    except Exception:
+        # A driver that already exited raises on attribute access.
+        return False
+    if not raw:
+        return False
+    try:
+        return Path(str(raw)).is_file()
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def _driver_env_applied(env: Dict[str, str]):
+    """Apply ``env`` to the process for the duration of the block.
+
+    ``sync_playwright()`` spawns the driver as a child process, so the temp
+    variables must be in ``os.environ`` when it starts.  They are restored
+    afterwards so an overridden temp dir does not leak into the rest of the
+    scan, which starts subprocesses of its own (``icmp_ping``).
+    """
+    saved = {name: os.environ.get(name) for name in env}
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def detect_browsers(playwright: Optional[Any] = None) -> Dict[str, bool]:
+    """
+    Map every engine name to whether its binary is present.
+
+    Args:
+        playwright: An existing Playwright object.  When omitted, one is
+            started; if the optional package is missing, or its driver cannot
+            be spawned at all, every engine reports ``False`` rather than
+            raising.  "Cannot tell" must read as "not installed", because the
+            caller's correct response is to fall back to the local ARP table.
+    """
+    detected: Dict[str, bool] = {name: False for name in BROWSER_NAMES}
+
+    if playwright is None:
+        try:
+            import playwright as _playwright_package  # noqa: F401
+
+            from playwright.sync_api import sync_playwright
+
+            with _driver_env_applied(_driver_env()):
+                playwright = sync_playwright().start()
+        except Exception as exc:
+            log.debug("could not start the Playwright driver: %s", exc)
+            return detected
+
+    try:
+        for name in BROWSER_NAMES:
+            engine = getattr(playwright, name, None)
+            detected[name] = engine is not None and is_browser_installed(engine)
+            if detected[name]:
+                log.debug("playwright engine %s is installed", name)
+    finally:
+        stop = getattr(playwright, "stop", None)
+        if stop is not None:
+            with contextlib.suppress(Exception):
+                stop()
+
+    return detected
+
+
+def first_available_browser(
+    playwright: Optional[Any] = None,
+    order: Optional[Tuple[str, ...]] = None,
+    requested: Optional[str] = None,
+) -> str:
+    """
+    Name of the first installed engine, in preference order.
+
+    Args:
+        playwright: Reuse an existing Playwright object.
+        order: Engines to try, most preferred first.  Defaults to
+            :data:`BROWSER_NAMES`.
+        requested: An explicit engine (``--browser`` / ``PW_BROWSER``).  Used
+            verbatim, and it is an error if it is not installed — silently
+            substituting a different engine would hide a broken setup.
+
+    Raises:
+        BrowserNotInstalled: When no usable engine is found.  The message
+            names the missing engines and the command that fixes it.
+    """
+    candidates = order or BROWSER_NAMES
+
+    if requested:
+        if requested not in BROWSER_NAMES:
+            raise BrowserNotInstalled(
+                f"unknown browser engine {requested!r}; "
+                f"expected one of {', '.join(BROWSER_NAMES)}"
+            )
+        detected = detect_browsers(playwright)
+        if not detected.get(requested):
+            raise BrowserNotInstalled(
+                f"the requested browser engine {requested!r} is not installed; "
+                f"run `{BROWSER_INSTALL_HINT} {requested}`"
+            )
+        return requested
+
+    detected = detect_browsers(playwright)
+    for name in candidates:
+        if detected.get(name):
+            log.info("Using Playwright browser engine: %s", name)
+            return name
+
+    raise BrowserNotInstalled(
+        "no Playwright browser is installed "
+        f"({', '.join(f'{name}=no' for name in candidates)}); "
+        f"run `{BROWSER_INSTALL_HINT}` to download one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Local ARP table fallback
+# ---------------------------------------------------------------------------
+#: Columns every local ARP result carries.
+ARP_COLUMNS: Tuple[str, ...] = ("host", "mac_address", "ip_address", "valid_time")
+
+_ALL_ZERO_MAC = "00:00:00:00:00:00"
+_BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+
+
+def _normalise_mac(raw: str) -> str:
+    """Return ``aa:bb:cc:dd:ee:ff`` lower-case, padding short BSD octets."""
+    text = (raw or "").strip().lower()
+    if not text:
+        return ""
+    if ":" in text:
+        octets = text.split(":")
+    elif "-" in text:
+        octets = text.split("-")
+    else:
+        cleaned = re.sub(r"[^0-9a-f]", "", text)
+        if len(cleaned) != 12:
+            return text
+        octets = [cleaned[i:i + 2] for i in range(0, 12, 2)]
+
+    if len(octets) != 6 or any(
+        not re.fullmatch(r"[0-9a-f]{1,2}", octet) for octet in octets
+    ):
+        return text
+    return ":".join(octet.rjust(2, "0") for octet in octets)
+
+
+def _is_usable_host(ip: str, mac: str) -> bool:
+    """Filter out broadcast/multicast addresses and unresolved entries."""
+    if mac in (_ALL_ZERO_MAC, _BROADCAST_MAC):
+        return False
+    try:
+        address = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return not (address.is_multicast or address.is_unspecified)
+
+
+def _run_command(command: List[str], timeout: float = 10.0) -> str:
+    """Run a command with a list argv — never a shell string."""
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout or ""
+
+
+def parse_proc_net_arp(output: str) -> List[Dict[str, Any]]:
+    """Parse ``/proc/net/arp`` (Linux)."""
+    rows: List[Dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or parts[0].lower() == "ip":
+            continue
+        ip, _hwtype, flags, mac, _mask, device = parts[:6]
+        if flags.lower() in ("0x0", "0x00"):
+            continue
+        mac = _normalise_mac(mac)
+        if not _is_usable_host(ip, mac):
+            continue
+        rows.append({"ip": ip, "mac_address": mac, "mode": "arp", "interface": device})
+    return rows
+
+
+def parse_ip_neigh(output: str) -> List[Dict[str, Any]]:
+    """Parse ``ip neigh show`` (Linux)."""
+    rows: List[Dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if "lladdr" not in parts:
+            continue
+        ip = parts[0]
+        mac = parts[parts.index("lladdr") + 1]
+        interface = parts[parts.index("dev") + 1] if "dev" in parts else None
+        mac = _normalise_mac(mac)
+        if not _is_usable_host(ip, mac):
+            continue
+        rows.append({"ip": ip, "mac_address": mac, "mode": "arp", "interface": interface})
+    return rows
+
+
+def parse_windows_arp(output: str) -> List[Dict[str, Any]]:
+    """Parse ``arp -a`` on Windows."""
+    rows: List[Dict[str, Any]] = []
+    interface: Optional[str] = None
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        header = re.match(r"^Interface:\s*(\S+)", stripped)
+        if header:
+            interface = header.group(1)
+            continue
+        if stripped.lower().startswith("internet address"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 3:
+            continue
+        ip, mac, entry_type = parts[0], parts[1], parts[2]
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+            continue
+        mac = _normalise_mac(mac)
+        if entry_type.lower() != "dynamic" or not _is_usable_host(ip, mac):
+            continue
+        rows.append({"ip": ip, "mac_address": mac, "mode": "arp", "interface": interface})
+    return rows
+
+
+def parse_bsd_arp(output: str) -> List[Dict[str, Any]]:
+    """Parse ``arp -an`` on macOS/BSD."""
+    rows: List[Dict[str, Any]] = []
+    # The MAC is hex octets; ``(incomplete)`` must not be mistaken for one.
+    pattern = re.compile(
+        r"^[?\w.-]*\s*\((?P<ip>[\d.]+)\)\s+at\s+"
+        r"(?P<mac>[0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})"
+        r"(?:\s+on\s+(?P<iface>\S+))?"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        ip = match.group("ip")
+        mac = _normalise_mac(match.group("mac"))
+        if not _is_usable_host(ip, mac):
+            continue
+        rows.append({
+            "ip": ip,
+            "mac_address": mac,
+            "mode": "arp",
+            "interface": match.group("iface"),
+        })
+    return rows
+
+
+def local_arp_leases() -> pd.DataFrame:
+    """
+    Read this machine's ARP table, with no third-party dependency.
+
+    This is the OS-independent fallback for when Playwright has no browser to
+    launch: the router's web UI is unreachable without one, but the neighbour
+    table already lists every host this machine has talked to.  Every platform
+    route is tried in turn, so the same code works on Linux, macOS, BSD and
+    Windows:
+
+    * Linux    — ``/proc/net/arp``, then ``ip neigh show``
+    * BSD/macOS — ``arp -an``
+    * Windows  — ``arp -a``
+
+    Returns a DataFrame with ``host``, ``mac_address``, ``ip_address`` and
+    ``valid_time``, matching what the router scrape produces so the rest of
+    the pipeline cannot tell the difference.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    proc = Path("/proc/net/arp")
+    try:
+        if proc.exists():
+            rows = parse_proc_net_arp(proc.read_text(encoding="utf-8", errors="ignore"))
+    except OSError:
+        rows = []
+
+    if not rows:
+        for command, parser in (
+            (["ip", "neigh", "show"], parse_ip_neigh),
+            (["arp", "-an"], parse_bsd_arp),
+            (["arp", "-a"], parse_windows_arp if platform.system().lower() == "windows"
+             else parse_bsd_arp),
+        ):
+            output = _run_command(command)
+            if not output.strip():
+                continue
+            rows = parser(output)
+            if rows:
+                log.info("Local ARP table from `%s` (%d entries)", " ".join(command), len(rows))
+                break
+
+    if not rows:
+        log.warning("No local ARP entries found; the lease table will be empty.")
+
+    frame = pd.DataFrame(rows, columns=["ip", "mac_address", "mode", "interface"])
+    if frame.empty:
+        frame = pd.DataFrame(columns=["ip", "mac_address", "mode"])
+
+    frame["ip_address"] = frame["ip"]
+    # An ARP table carries no hostname, so the address is the only label.
+    frame["host"] = frame["ip_address"]
+    frame["valid_time"] = None
+    return frame
+
+
+def scrape_router_dhcp(requested_browser: Optional[str] = None) -> pd.DataFrame:
     """
     Scrape the TP-Link router DHCP lease table via Playwright.
+
+    The browser engine is detected at run time: ``pip install playwright``
+    does not install a browser binary, and launching an engine whose binary is
+    missing fails with "Executable doesn't exist".  Pass ``requested_browser``
+    to force one; otherwise the first installed engine wins.
 
     The raw HTML dump is written to ``data/tplogin-arp.html``.
 
     Returns a DataFrame with columns:
         host, mac_address, ip_address, valid_time
     """
+    from playwright.sync_api import sync_playwright
+
+    # Detect the engine *before* prompting for a password: there is no point
+    # asking for credentials we cannot use, and the missing-browser error is
+    # the useful thing to surface.
+    engine_name = first_available_browser(requested=requested_browser)
     password = get_password()
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+    with _driver_env_applied(_driver_env()), sync_playwright() as playwright:
+        browser = getattr(playwright, engine_name).launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
 
@@ -657,6 +1127,23 @@ def scrape_router_dhcp() -> pd.DataFrame:
     df.columns = ["host", "mac_address", "ip_address", "valid_time"]
     df = df.iloc[1:, :].reset_index(drop=True)
     return df
+
+
+def fetch_leases(requested_browser: Optional[str] = None) -> pd.DataFrame:
+    """
+    The router's DHCP lease table, or this machine's ARP table as a fallback.
+
+    A browser is needed to drive the router's web UI.  When none is installed
+    the router is simply unreachable, so instead of dying the scan degrades to
+    the OS-independent local ARP table — no browser, no credentials, no extra
+    dependency — and still reports every host this machine can see.
+    """
+    try:
+        return scrape_router_dhcp(requested_browser=requested_browser)
+    except BrowserNotInstalled as exc:
+        log.warning("Cannot scrape the router with Playwright: %s", exc)
+        log.warning("Falling back to the local ARP table.")
+        return local_arp_leases()
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +1195,10 @@ def resolve_and_test_hosts() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run(port_timeout: Optional[float] = None) -> pd.DataFrame:
+def run(
+    port_timeout: Optional[float] = None,
+    browser: Optional[str] = None,
+) -> pd.DataFrame:
     """
     Main entry point: DNS resolution, router scrape, port scan, export.
 
@@ -716,6 +1206,9 @@ def run(port_timeout: Optional[float] = None) -> pd.DataFrame:
         port_timeout: Override for the port detection timeout (seconds).
             If ``None``, the value is resolved from the ``PORT_TIMEOUT``
             environment variable, then ``DEFAULT_PORT_TIMEOUT``.
+        browser: Playwright engine to use for the router scrape.  If ``None``,
+            the ``PW_BROWSER`` environment variable is consulted, and failing
+            that the first installed engine is used.
     """
     global PORT_SCAN_TIMEOUT
     PORT_SCAN_TIMEOUT = resolve_port_timeout(port_timeout)
@@ -730,9 +1223,9 @@ def run(port_timeout: Optional[float] = None) -> pd.DataFrame:
     log.info("[+] DNS resolution results saved to %s", DNS_CSV_FILE)
 
     # ------------------------------------------------------------------
-    # 2. Router DHCP scrape
+    # 2. Router DHCP scrape, or the local ARP table when no browser exists
     # ------------------------------------------------------------------
-    df = scrape_router_dhcp()
+    df = fetch_leases(requested_browser=browser or os.environ.get("PW_BROWSER", "").strip() or None)
 
     # ------------------------------------------------------------------
     # 3. ICMP ping check for each lease
@@ -813,4 +1306,4 @@ if __name__ == "__main__":
 
     load_dotenv()  # loads .env from the current working directory
     args = parse_cli_args()
-    run(port_timeout=args.port_timeout)
+    run(port_timeout=args.port_timeout, browser=args.browser)

@@ -21,6 +21,7 @@ attribute Playwright itself launches from — rather than guessing at the
 from __future__ import annotations
 
 import pytest
+
 from my_lan_prober.browsers import (
     BROWSER_NAMES,
     BrowserNotInstalled,
@@ -182,3 +183,41 @@ def test_detection_reports_nothing_when_playwright_is_absent(monkeypatch):
     assert detect_browsers() == {"chromium": False, "firefox": False, "webkit": False}
     with pytest.raises(BrowserNotInstalled):
         first_available_browser()
+
+
+def test_detection_survives_a_driver_that_cannot_start(monkeypatch):
+    """A driver that dies on startup means "unknown", never a crash.
+
+    Playwright's driver is a child process, and on a Windows sandbox it can
+    die inside ``asyncio.windows_utils.pipe()`` with ``WinError 5`` before it
+    reports anything.  That must degrade to "no browser detected" so the scan
+    falls through to the local ARP table, not take the whole process down.
+    """
+    import my_lan_prober.browsers as browsers
+
+    def explode():
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(browsers, "playwright_object", explode)
+
+    # detect_browsers must swallow it; first_available_browser must turn it
+    # into the actionable error a user can actually act on.
+    try:
+        assert detect_browsers() == {"chromium": False, "firefox": False, "webkit": False}
+    except PermissionError:  # pragma: no cover - the regression under test
+        pytest.fail("detect_browsers propagated a driver-startup failure")
+
+    with pytest.raises(BrowserNotInstalled):
+        first_available_browser()
+
+
+def test_is_browser_installed_tolerates_a_broken_engine_object():
+    """Detection must never raise on an unexpected engine shape."""
+
+    class Broken:
+        @property
+        def executable_path(self):
+            raise RuntimeError("driver already exited")
+
+    assert is_browser_installed(Broken()) is False
+    assert is_browser_installed(object()) is False

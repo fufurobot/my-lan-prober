@@ -297,9 +297,11 @@ def test_build_fetcher_auto_still_ends_at_the_local_arp_table(monkeypatch):
         classmethod(lambda cls: {"chromium": False, "firefox": False, "webkit": False}),
     )
 
-    kinds = [type(fetcher) for fetcher in build_fetcher("auto").fetchers()]
+    chain = build_fetcher("auto")
+    kinds = [type(fetcher) for fetcher in chain.fetchers()]
 
-    assert kinds[0] is PlaywrightFetcher
+    # TPLoginFetcher *is* the Playwright source, so isinstance is the right check.
+    assert isinstance(chain.fetchers()[0], PlaywrightFetcher)
     assert UnixArpFetcher in kinds
     assert kinds[-1] in (UnixArpFetcher, WindowsArpFetcher)
 

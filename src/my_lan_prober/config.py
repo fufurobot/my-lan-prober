@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from .browsers import BROWSER_NAMES
 from .probes import COMMON_PORTS, DEFAULT_PORT_TIMEOUT, RESOLVE_HOSTS
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "resolve_port_timeout",
     "ensure_temp_env",
     "FETCHER_CHOICES",
+    "BROWSER_NAMES",
 ]
 
 FETCHER_CHOICES = ("tplogin", "unix", "windows", "openwrt", "auto")
@@ -154,9 +156,16 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--browser",
+        choices=BROWSER_NAMES,
         default=None,
         metavar="NAME",
-        help="Playwright browser engine (chromium/firefox/webkit).",
+        help=(
+            "Playwright browser engine to use. Default: auto-detect the first "
+            "engine that is installed ("
+            + ", ".join(BROWSER_NAMES)
+            + "). Installing the Python package does not install a browser; "
+            "run `playwright install` for that."
+        ),
     )
     return parser.parse_args(argv)
 

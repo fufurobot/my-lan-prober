@@ -348,22 +348,36 @@ def test_playwright_fetcher_uses_the_first_installed_browser(monkeypatch):
     assert PlaywrightFetcher().browser_engine_name() == "firefox"
 
 
-def test_playwright_fetcher_prefers_an_explicit_browser_when_present(monkeypatch):
+def test_playwright_fetcher_honours_an_explicit_browser(monkeypatch):
+    """An explicit request is used verbatim, ahead of the default order."""
     from my_lan_prober.fetchers import PlaywrightFetcher
 
     monkeypatch.setattr(
         PlaywrightFetcher,
         "installed_browsers",
-        classmethod(lambda cls: {"chromium": True, "firefox": True, "webkit": False}),
+        classmethod(lambda cls: {"chromium": True, "firefox": True, "webkit": True}),
     )
 
-    assert PlaywrightFetcher(browser="webkit").browser_engine_name() == "chromium"
+    assert PlaywrightFetcher(browser="webkit").browser_engine_name() == "webkit"
     assert PlaywrightFetcher(browser="firefox").browser_engine_name() == "firefox"
 
 
-def test_playwright_fetcher_rejects_a_requested_browser_that_is_missing(monkeypatch):
-    from my_lan_prober.browsers import BrowserNotInstalled
+def test_playwright_fetcher_reads_the_env_when_no_browser_is_given(monkeypatch):
+    from my_lan_prober.fetchers import PlaywrightFetcher
 
+    monkeypatch.setenv("PW_BROWSER", "webkit")
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": True, "firefox": True, "webkit": True}),
+    )
+
+    assert PlaywrightFetcher().browser_engine_name() == "webkit"
+
+
+def test_playwright_fetcher_rejects_a_requested_browser_that_is_missing(monkeypatch):
+    """Asking for webkit must not silently launch chromium instead."""
+    from my_lan_prober.browsers import BrowserNotInstalled
     from my_lan_prober.fetchers import PlaywrightFetcher
 
     monkeypatch.setattr(
@@ -372,8 +386,16 @@ def test_playwright_fetcher_rejects_a_requested_browser_that_is_missing(monkeypa
         classmethod(lambda cls: {"chromium": True, "firefox": False, "webkit": False}),
     )
 
-    with pytest.raises(BrowserNotInstalled):
+    with pytest.raises(BrowserNotInstalled, match="playwright install webkit"):
         PlaywrightFetcher(browser="webkit").browser_engine_name()
+
+
+def test_playwright_fetcher_rejects_an_unknown_engine(monkeypatch):
+    from my_lan_prober.browsers import BrowserNotInstalled
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    with pytest.raises(BrowserNotInstalled, match="unknown browser engine"):
+        PlaywrightFetcher(browser="edge").browser_engine_name()
 
 
 # ---------------------------------------------------------------------------

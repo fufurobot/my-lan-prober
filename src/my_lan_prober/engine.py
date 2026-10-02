@@ -24,7 +24,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from .config import Config
-from .fetchers import FetcherChain, TPLoginFetcher, UnixArpFetcher, WindowsArpFetcher
+from .fetchers import (
+    TPLoginFetcher,
+    UnixArpFetcher,
+    WindowsArpFetcher,
+    default_fetcher_chain,
+)
 from .probes import ServiceIdentifier, icmp_ping, probe_service
 
 log = logging.getLogger(__name__)
@@ -101,10 +106,14 @@ def write_ssh_config(
     return config_path
 
 
-def build_fetcher(kind: str) -> Any:
-    """Instantiate the requested ARP source."""
+def build_fetcher(kind: str, browser: Optional[str] = None) -> Any:
+    """Instantiate the requested ARP source.
+
+    ``browser`` names the Playwright engine to use; ``None`` auto-detects the
+    first engine this machine actually has installed.
+    """
     if kind == "tplogin":
-        return TPLoginFetcher()
+        return TPLoginFetcher(browser=browser)
     if kind == "unix":
         return UnixArpFetcher()
     if kind == "windows":
@@ -114,7 +123,7 @@ def build_fetcher(kind: str) -> Any:
 
         return OpenWRTFetcher()
     # "auto"/anything else: router first, then the local table.
-    return FetcherChain([TPLoginFetcher(), UnixArpFetcher(), WindowsArpFetcher()])
+    return default_fetcher_chain(browser=browser)
 
 
 class Engine:
@@ -141,7 +150,7 @@ class Engine:
         return probe_service(ip, port, timeout=self.config.port_timeout)
 
     def fetch_leases(self) -> pd.DataFrame:
-        return build_fetcher(self.config.fetcher).iptable()
+        return build_fetcher(self.config.fetcher, browser=self.config.browser).iptable()
 
     def identify(self, banner: Optional[str], port: int, ip: Optional[str] = None):
         return self.identifier.identify(banner, port, ip=ip)

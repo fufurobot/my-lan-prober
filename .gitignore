@@ -242,3 +242,6 @@ build/
 .ci_watch.py
 .ci-log-*.txt
 .ci-venv
+
+# Transient commit-message scratch files
+.commit-msg.tmp

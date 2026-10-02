@@ -24,6 +24,14 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .bridge import AsyncBridge, default_bridge
+from .browsers import (
+    BROWSER_NAMES,
+    BrowserNotInstalled,
+    detect_browsers,
+    first_available_browser,
+    installed_browsers,
+    is_browser_installed,
+)
 from .config import Config, ensure_temp_env, parse_cli_args
 from .engine import Engine, write_ssh_config
 from .fetchers import (
@@ -34,6 +42,7 @@ from .fetchers import (
     TPLoginFetcher,
     UnixArpFetcher,
     WindowsArpFetcher,
+    default_fetcher_chain,
 )
 from .framing import (
     DatagramFraming,
@@ -91,11 +100,19 @@ __all__ = [
     # fetchers
     "ARPTableFetcher",
     "FetcherChain",
+    "default_fetcher_chain",
     "TPLoginFetcher",
     "PlaywrightFetcher",
     "UnixArpFetcher",
     "WindowsArpFetcher",
     "OpenWRTFetcher",
+    # browsers
+    "BROWSER_NAMES",
+    "BrowserNotInstalled",
+    "detect_browsers",
+    "installed_browsers",
+    "is_browser_installed",
+    "first_available_browser",
     # framing
     "Framing",
     "StreamFraming",

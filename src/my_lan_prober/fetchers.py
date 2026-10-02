@@ -36,6 +36,7 @@ __all__ = [
     "WindowsArpFetcher",
     "OpenWRTFetcher",
     "FetcherChain",
+    "default_fetcher_chain",
     "parse_windows_arp",
     "parse_proc_net_arp",
     "parse_ip_neigh",
@@ -393,9 +394,82 @@ class PlaywrightFetcher(ARPTableFetcher):
     #: Project-local scratch directory, beside the package working directory.
     FALLBACK_TEMP_DIR = Path.cwd() / "playwright-temp"
 
-    def __init__(self, password: Optional[str] = None, *, headless: bool = False) -> None:
+    def __init__(
+        self,
+        password: Optional[str] = None,
+        *,
+        headless: bool = False,
+        browser: Optional[str] = None,
+    ) -> None:
         self.password = password
         self.headless = headless
+        #: Explicit engine request (``--browser`` / ``PW_BROWSER``), or ``None``
+        #: to auto-detect the first installed engine.
+        self.browser = browser or os.environ.get("PW_BROWSER", "").strip() or None
+
+    # -- browser engine selection --------------------------------------
+    @classmethod
+    def installed_browsers(cls) -> Dict[str, bool]:
+        """Every Playwright engine, and whether this machine has its binary.
+
+        ``pip install playwright`` downloads no browser, so this is the check
+        that decides whether the router can be scraped at all.
+        """
+        from .browsers import installed_browsers
+
+        return installed_browsers()
+
+    def browser_engine_name(self) -> str:
+        """Which engine to launch: the requested one, else the first installed.
+
+        An explicitly requested engine that is missing raises rather than
+        silently substituting another: the user asked for that engine, and
+        quietly using a different one would hide a broken setup.
+        """
+        from .browsers import BROWSER_NAMES, BrowserNotInstalled
+
+        # Validate first: an unknown name is a typo in a flag, and there is no
+        # reason to start a browser driver (or probe the disk) to notice it.
+        if self.browser and self.browser not in BROWSER_NAMES:
+            raise BrowserNotInstalled(
+                f"unknown browser engine {self.browser!r}; "
+                f"expected one of {', '.join(BROWSER_NAMES)}"
+            )
+
+        detected = self.installed_browsers()
+
+        if self.browser:
+            if not detected.get(self.browser):
+                raise BrowserNotInstalled(
+                    f"the requested browser engine {self.browser!r} is not installed; "
+                    f"run `playwright install {self.browser}`"
+                )
+            return self.browser
+
+        for name in BROWSER_NAMES:
+            if detected.get(name):
+                log.info("Using Playwright browser engine: %s", name)
+                return name
+
+        raise BrowserNotInstalled(
+            "no Playwright browser is installed "
+            f"({', '.join(f'{name}=no' for name in BROWSER_NAMES)}); "
+            "run `playwright install` to download one"
+        )
+
+    def available(self) -> bool:
+        """Whether a browser exists to be launched.
+
+        The chain consults this *before* calling :meth:`iptable`, so a machine
+        without any browser falls through to the local ARP table instead of
+        raising "Executable doesn't exist" mid-scan.
+        """
+        try:
+            self.browser_engine_name()
+        except Exception as exc:
+            log.debug("%s is unavailable: %s", type(self).__name__, exc)
+            return False
+        return True
 
     # -- temp directory handling ---------------------------------------
     @staticmethod
@@ -538,6 +612,10 @@ class PlaywrightFetcher(ARPTableFetcher):
     def iptable(self) -> pd.DataFrame:
         from playwright.sync_api import sync_playwright
 
+        # Pick the engine *before* prompting for a password: there is no point
+        # asking for credentials we cannot use, and the error is the useful
+        # thing to surface when a machine has no browser at all.
+        engine_name = self.browser_engine_name()
         password = self.get_password()
         self.HTML_DUMP.parent.mkdir(parents=True, exist_ok=True)
 
@@ -547,7 +625,7 @@ class PlaywrightFetcher(ARPTableFetcher):
         # launch dies (EPERM at mkdtemp on 3.13, WinError 5 inside asyncio's
         # pipe creation on 3.10) before it ever starts.
         with _driver_env_applied(self.driver_env()), sync_playwright() as playwright:
-            browser = getattr(playwright, self._browser_name()).launch(headless=self.headless)
+            browser = getattr(playwright, engine_name).launch(headless=self.headless)
             context = browser.new_context()
             try:
                 html = self.run(context, password)
@@ -559,9 +637,8 @@ class PlaywrightFetcher(ARPTableFetcher):
         return self.parse_html(self.HTML_DUMP)
 
     def _browser_name(self) -> str:
-        import os
-
-        return os.environ.get("PW_BROWSER", "chromium").strip() or "chromium"
+        """Deprecated alias for :meth:`browser_engine_name`."""
+        return self.browser_engine_name()
 
     @staticmethod
     def parse_html(path: Any) -> pd.DataFrame:
@@ -673,7 +750,17 @@ class FetcherChain(ARPTableFetcher):
 
     def iptable(self) -> pd.DataFrame:
         errors: List[str] = []
+        unavailable: List[str] = []
         for fetcher in self._fetchers:
+            # Ask before calling: a source that cannot possibly run here (no
+            # browser installed, no SSH host configured) is skipped outright
+            # rather than called and caught.  That distinction matters because
+            # the *reason* is the useful part, and for Playwright the failure
+            # would otherwise be a confusing "Executable doesn't exist".
+            if not self._is_available(fetcher):
+                unavailable.append(type(fetcher).__name__)
+                log.debug("ARP source %s is not available here; skipping", type(fetcher).__name__)
+                continue
             try:
                 frame = self._validate(fetcher.iptable())
             except Exception as exc:
@@ -686,12 +773,38 @@ class FetcherChain(ARPTableFetcher):
             log.info("ARP table from %s (%d entries)", type(fetcher).__name__, len(frame))
             return frame
 
-        raise RuntimeError("no ARP source produced a table: " + "; ".join(errors))
+        if errors:
+            raise RuntimeError("no ARP source produced a table: " + "; ".join(errors))
+        raise RuntimeError(
+            "every ARP source is unavailable here: "
+            + ", ".join(unavailable)
+            + " (no Playwright browser installed? run `playwright install`)"
+        )
+
+    @staticmethod
+    def _is_available(fetcher: ARPTableFetcher) -> bool:
+        """Whether ``fetcher`` can run here; a broken check is not fatal."""
+        try:
+            return fetcher.available()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("availability check for %s raised: %s", type(fetcher).__name__, exc)
+            return False
 
 
-def default_fetcher_chain() -> FetcherChain:
-    """TP-Link first, then whichever local ARP table this OS provides."""
-    return FetcherChain([TPLoginFetcher(), UnixArpFetcher(), WindowsArpFetcher()])
+def default_fetcher_chain(browser: Optional[str] = None) -> FetcherChain:
+    """TP-Link first, then whichever local ARP table this OS provides.
+
+    The local sources are the answer to "Playwright has no browser": they need
+    no credentials, no browser, and no extra dependency, so the scan degrades
+    to a plain ARP sweep instead of failing.
+    """
+    return FetcherChain(
+        [
+            TPLoginFetcher(browser=browser),
+            UnixArpFetcher(),
+            WindowsArpFetcher(),
+        ]
+    )
 
 
 @contextlib.contextmanager

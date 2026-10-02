@@ -11,15 +11,88 @@ import argparse
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .probes import COMMON_PORTS, DEFAULT_PORT_TIMEOUT, RESOLVE_HOSTS
 
-__all__ = ["Config", "parse_cli_args", "resolve_port_timeout", "FETCHER_CHOICES"]
+__all__ = [
+    "Config",
+    "parse_cli_args",
+    "resolve_port_timeout",
+    "ensure_temp_env",
+    "FETCHER_CHOICES",
+]
 
 FETCHER_CHOICES = ("tplogin", "unix", "windows", "openwrt", "auto")
 
 DEFAULT_OUTPUT = "data/tplogin-arp-enriched.csv"
+
+#: Variables every child process consults, in Playwright's own priority order.
+TEMP_ENV_VARS: Sequence[str] = ("TMPDIR", "TMP", "TEMP")
+
+#: Working directory for :func:`ensure_temp_env`.
+TEMP_ENV_CWD = Path.cwd()
+
+
+def _temp_dir_is_usable(path: Path) -> bool:
+    """Whether a file can really be created in ``path`` (see ``fetchers``)."""
+    from .fetchers import PlaywrightFetcher
+
+    return PlaywrightFetcher.temp_dir_is_usable(path)
+
+
+def ensure_temp_env(base_dir: Optional[Path] = None) -> Optional[Path]:
+    """Point ``TMPDIR``/``TMP``/``TEMP`` at a writable directory.
+
+    Playwright on CPython 3.10 on Windows fails to launch its Node driver when
+    the inherited temp directory is not writable::
+
+        PermissionError: [WinError 5] Access is denied
+          ... asyncio\\windows_utils.py: pipe() -> CreateFile()
+
+    (note that this surfaces as a *pipe* failure while the driver starts, not
+    as the ``mkdtemp`` EPERM of the 3.13-era traceback — same root cause, a
+    temp directory the process cannot use).
+
+    Call this once, as early as possible in ``main()``, so the whole process
+    tree inherits the repaired values.  Playwright's Node driver reads
+    ``os.tmpdir()``, which honours ``TMPDIR`` → ``TMP`` → ``TEMP`` without any
+    fallback of its own, while CPython's own ``tempfile`` silently probes and
+    falls through.  That asymmetry is why the fix has to be an environment
+    variable rather than a Python-level fallback.
+
+    Returns the directory that was exported, or ``None`` when no candidate was
+    usable (in which case the environment is left exactly as it was — a broken
+    temp directory is a better failure than a silently substituted one).
+    """
+    base = Path(base_dir) if base_dir is not None else TEMP_ENV_CWD
+
+    candidates: List[Path] = []
+    for name in TEMP_ENV_VARS:
+        raw = os.environ.get(name, "").strip()
+        # A POSIX-style path only exists inside MSYS2; a native Windows child
+        # cannot use it, so it is never a candidate there.
+        if raw and not (os.name == "nt" and raw.startswith("/")):
+            candidates.append(Path(raw))
+    candidates.append(base / "playwright-temp")
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if _temp_dir_is_usable(candidate):
+            exported = str(candidate.resolve())
+            for name in TEMP_ENV_VARS:
+                os.environ[name] = exported
+            return Path(exported)
+
+    return None
 
 
 def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -153,7 +226,7 @@ class Config:
     _SECRET_FIELDS = ("password",)
 
     def __repr__(self) -> str:  # pragma: no cover - trivial formatting
-        shown = {
+        shown: Dict[str, object] = {
             key: ("***" if key in self._SECRET_FIELDS else value)
             for key, value in self.__dict__.items()
         }

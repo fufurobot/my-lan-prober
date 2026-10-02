@@ -24,7 +24,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .bridge import AsyncBridge, default_bridge
-from .config import Config, parse_cli_args
+from .config import Config, ensure_temp_env, parse_cli_args
 from .engine import Engine, write_ssh_config
 from .fetchers import (
     ARPTableFetcher,
@@ -79,6 +79,7 @@ __all__ = [
     "__version__",
     "main",
     "load_env",
+    "ensure_temp_env",
     # bridge
     "AsyncBridge",
     "default_bridge",
@@ -152,7 +153,15 @@ def load_env() -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None):
-    """CLI entry point: load ``.env``, resolve config, run the engine."""
+    """CLI entry point: load ``.env``, repair the temp env, run the engine.
+
+    ``ensure_temp_env`` runs before anything else because Playwright's Node
+    driver inherits this process's environment: on CPython 3.10 for Windows an
+    unusable inherited temp directory kills the browser launch inside
+    ``asyncio``'s pipe creation, and no amount of Python-level care in the
+    Playwright call site can repair that after the fact.
+    """
     load_env()
+    ensure_temp_env()
     config = Config.resolve(argv)
     return Engine(config).run()

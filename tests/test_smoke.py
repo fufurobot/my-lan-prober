@@ -25,6 +25,16 @@ Node driver does no such fallback — it hands the first candidate straight to
 
 That asymmetry is why the traceback is confusing: Python's own temp handling
 looks healthy while the subprocess fails.
+
+The same root cause has a second, differently-shaped symptom on CPython 3.10
+for Windows, where the launch dies while *creating the driver's pipes*::
+
+    PermissionError: [WinError 5] Access is denied
+      ... asyncio\\windows_utils.py: pipe() -> CreateFile()
+
+Both are fixed the same way — the environment is repaired at process start by
+``my_lan_prober.config.ensure_temp_env``, which points ``TMPDIR``/``TMP``/
+``TEMP`` at ``playwright-temp`` in the current directory.
 """
 
 from __future__ import annotations
@@ -213,12 +223,131 @@ def test_driver_env_finds_a_fallback_when_every_candidate_is_bad(monkeypatch, tm
     monkeypatch.setenv("TEMP", "/nope")
     monkeypatch.setenv("LOCALAPPDATA", "/nope")
     monkeypatch.setenv("SYSTEMROOT", "/nope")
+    fallback = tmp_path / "playwright-temp"
+    monkeypatch.setattr(PlaywrightFetcher, "FALLBACK_TEMP_DIR", fallback)
 
     env = PlaywrightFetcher.driver_env()
 
     chosen = Path(env["TMPDIR"])
     assert _tmpdir_is_writable(chosen)
-    assert chosen.name == ".tmp"
+    assert chosen == fallback
+
+
+def test_driver_env_rejects_msys_style_paths_on_windows(monkeypatch):
+    """An MSYS2 ``/tmp`` is not a path a native Windows child can use.
+
+    ``Path('/tmp')`` is a perfectly good temp directory on Linux, where half
+    the CI matrix runs, so the rejection is conditional on ``os.name``.
+    """
+    if os.name != "nt":
+        pytest.skip("POSIX-style temp paths are valid off Windows")
+
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    monkeypatch.setenv("TMP", "/tmp")
+    monkeypatch.setenv("TEMP", "/tmp")
+
+    env = PlaywrightFetcher.driver_env()
+
+    assert Path(env["TMPDIR"]).is_absolute()
+    assert not env["TMPDIR"].startswith("/")
+    assert _tmpdir_is_writable(Path(env["TMPDIR"]))
+
+
+# ---------------------------------------------------------------------------
+# The environment repair performed at process start
+# ---------------------------------------------------------------------------
+def test_ensure_temp_env_points_every_variable_at_a_writable_directory(monkeypatch, tmp_path):
+    """The 3.10 fix: repair the temp env before any child process starts.
+
+    Playwright's Node driver is a child process, and on CPython 3.10 for
+    Windows an unusable inherited temp directory kills the launch inside
+    asyncio's pipe creation.  Only an environment variable set *before* the
+    child starts can repair that, which is why this runs at the top of
+    ``main()`` rather than at the Playwright call site.
+    """
+    from my_lan_prober.config import TEMP_ENV_VARS, ensure_temp_env
+
+    monkeypatch.setenv("TMPDIR", "/nope")
+    monkeypatch.setenv("TMP", "/nope")
+    monkeypatch.setenv("TEMP", "/nope")
+
+    chosen = ensure_temp_env(tmp_path)
+
+    assert chosen is not None
+    assert _tmpdir_is_writable(chosen)
+    assert chosen == (tmp_path / "playwright-temp").resolve()
+    for name in TEMP_ENV_VARS:
+        assert os.environ[name] == str(chosen)
+
+
+def test_ensure_temp_env_keeps_a_usable_inherited_directory(monkeypatch, tmp_path):
+    from my_lan_prober.config import TEMP_ENV_VARS, ensure_temp_env
+
+    good = tmp_path / "good-temp"
+    good.mkdir()
+    for name in TEMP_ENV_VARS:
+        monkeypatch.setenv(name, str(good))
+
+    chosen = ensure_temp_env(tmp_path / "unused")
+
+    assert chosen == good.resolve()
+    assert not (tmp_path / "unused" / "playwright-temp").exists()
+
+
+def test_ensure_temp_env_leaves_a_broken_environment_alone(monkeypatch, tmp_path):
+    """No candidate usable → report failure instead of inventing a value.
+
+    ``ensure_temp_env`` returns ``None``; it must not set a variable to a
+    directory the child cannot use, because that would hide the real problem.
+    """
+    from my_lan_prober.config import ensure_temp_env
+
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file, not a directory", encoding="utf-8")
+    monkeypatch.setenv("TMPDIR", str(blocked / "sub"))
+    monkeypatch.setenv("TMP", str(blocked / "sub"))
+    monkeypatch.setenv("TEMP", str(blocked / "sub"))
+
+    assert ensure_temp_env(blocked) is None
+    assert os.environ["TMPDIR"] == str(blocked / "sub")
+
+
+def test_ensure_temp_env_creates_the_workaround_directory(monkeypatch, tmp_path):
+    """``playwright-temp`` is created on demand, under the given base."""
+    from my_lan_prober.config import ensure_temp_env
+
+    monkeypatch.setenv("TMPDIR", "/nope")
+    monkeypatch.setenv("TMP", "/nope")
+    monkeypatch.setenv("TEMP", "/nope")
+
+    chosen = ensure_temp_env(tmp_path / "base")
+
+    assert chosen == (tmp_path / "base" / "playwright-temp").resolve()
+    assert chosen.is_dir()
+
+
+def test_main_repairs_the_temp_env_before_running(monkeypatch, tmp_path):
+    """``main()`` must call the repair before the engine can start Playwright."""
+    import my_lan_prober
+
+    calls = []
+
+    def fake_ensure(base_dir=None):
+        calls.append(base_dir)
+        return tmp_path
+
+    class FakeEngine:
+        def __init__(self, config):
+            assert calls, "ensure_temp_env must run before the engine is built"
+
+        def run(self):
+            return "ran"
+
+    monkeypatch.setattr(my_lan_prober, "ensure_temp_env", fake_ensure)
+    monkeypatch.setattr(my_lan_prober, "Engine", FakeEngine)
+
+    assert my_lan_prober.main(["--fetcher", "unix"]) == "ran"
+    assert calls == [None]
 
 
 # ---------------------------------------------------------------------------

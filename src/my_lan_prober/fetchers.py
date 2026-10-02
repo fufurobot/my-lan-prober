@@ -390,6 +390,8 @@ class PlaywrightFetcher(ARPTableFetcher):
     HTML_DUMP = Path("data") / "tplogin-arp.html"
     #: Temp vars the Node driver reads, in its own priority order.
     TEMP_VARS = ("TMPDIR", "TMP", "TEMP")
+    #: Project-local scratch directory, beside the package working directory.
+    FALLBACK_TEMP_DIR = Path.cwd() / "playwright-temp"
 
     def __init__(self, password: Optional[str] = None, *, headless: bool = False) -> None:
         self.password = password
@@ -447,24 +449,26 @@ class PlaywrightFetcher(ARPTableFetcher):
     def resolve_driver_temp_dir(cls) -> Path:
         """First writable temp directory, in the driver's own priority order.
 
-        An MSYS2 shell exports ``TMPDIR`` as its own ``/tmp``, which a native
-        Windows process cannot use.  CPython's ``tempfile`` probes candidates
-        and silently falls through; the Node driver does not, so we do the
-        probing for it.
+        The inherited values are tried verbatim first: on CPython 3.10 for
+        Windows an unusable inherited directory is exactly what kills the
+        launch, but when the inherited one *is* usable, second-guessing it
+        would be a downgrade — the Store Python and the MSYS2 toolchain can
+        both leave ``AppData\\Local\\Temp`` itself wedged while an inherited
+        subdirectory of it works fine.
 
-        The inherited values are tried verbatim first — re-deriving a path
-        from ``%LOCALAPPDATA%`` would be a downgrade here, because the store
-        Python and the MSYS2 toolchain can both leave ``AppData\\Local\\Temp``
-        itself wedged while an inherited subdirectory of it works fine.
-
-        ``tempfile.gettempdir()`` is deliberately *not* used as a candidate:
-        when every real candidate fails it returns the current directory, so
-        accepting it would silently drop browser artifacts into the project.
+        The last resort is ``playwright-temp`` in the current directory, which
+        the project owns and can always create.  ``tempfile.gettempdir()`` is
+        deliberately *not* a candidate: when every real candidate fails it
+        returns the current directory itself, so accepting it would silently
+        drop browser artifacts into the project root instead of a subdirectory
+        we can ignore.
         """
         candidates: List[Path] = []
         for name in cls.TEMP_VARS:
             raw = os.environ.get(name, "").strip()
-            if raw:
+            # A POSIX-style path only exists inside MSYS2; a native Windows
+            # process cannot use one, so it is never a valid candidate here.
+            if raw and not (os.name == "nt" and raw.startswith("/")):
                 candidates.append(Path(raw))
 
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
@@ -475,7 +479,7 @@ class PlaywrightFetcher(ARPTableFetcher):
             candidates.append(Path(system_root) / "Temp")
 
         # Our own scratch directory, created on demand.
-        fallback = Path("data") / ".tmp"
+        fallback = cls.FALLBACK_TEMP_DIR
         candidates.append(fallback)
 
         seen = set()
@@ -484,11 +488,10 @@ class PlaywrightFetcher(ARPTableFetcher):
             if key in seen:
                 continue
             seen.add(key)
-            if candidate == fallback:
-                try:
-                    fallback.mkdir(parents=True, exist_ok=True)
-                except OSError:
-                    continue
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
             if cls.temp_dir_is_usable(candidate):
                 return candidate.resolve()
 
@@ -541,7 +544,8 @@ class PlaywrightFetcher(ARPTableFetcher):
         # Playwright's Node driver picks its artifacts directory with
         # os.tmpdir(), which honours TMPDIR/TMP/TEMP with no fallback.  Hand
         # it an env whose temp dir is known to be writable, or the browser
-        # launch dies with EPERM before it ever starts.
+        # launch dies (EPERM at mkdtemp on 3.13, WinError 5 inside asyncio's
+        # pipe creation on 3.10) before it ever starts.
         with _driver_env_applied(self.driver_env()), sync_playwright() as playwright:
             browser = getattr(playwright, self._browser_name()).launch(headless=self.headless)
             context = browser.new_context()

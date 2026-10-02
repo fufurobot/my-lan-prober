@@ -227,6 +227,10 @@ pytest-cache-files-*
 .pytest-tmp
 data/.tmp
 
+# Playwright's Node driver temp dir, kept inside the project because the
+# inherited %TEMP% is unusable on CPython 3.10 for Windows.
+playwright-temp/
+
 # Build outputs
 dist/
 build/

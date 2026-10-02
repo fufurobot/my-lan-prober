@@ -16,9 +16,6 @@ dependencies = [
 my-lan-prober = "my_lan_prober:main"
 
 [project.optional-dependencies]
-dotenv = [
-    "python-dotenv>=1.0.0",
-]
 ssh = [
     "asyncssh>=2.24.0",
 ]
@@ -88,4 +85,5 @@ dev = [
     "ruff>=0.16.9",
     "ty>=0.0.84",
     "types-requests>=2.33.0.20260906",
+    "python-dotenv>=1.0.0"
 ]

@@ -107,6 +107,7 @@ def playwright_object() -> Optional[Any]:
 
     # The driver is a child process and inherits our environment; on Windows
     # an unusable temp dir kills it before it can report anything.
+    context: Any
     try:
         from .fetchers import _driver_env_applied
 
@@ -196,6 +197,13 @@ def first_available_browser(
             f"install the optional extra and run `{INSTALL_HINT}`"
         )
 
+    # Read the paths while the driver is alive: a stopped driver raises or
+    # returns nothing on attribute access, so probing it afterwards would
+    # report "<not set>" for every engine and lose the useful diagnosis.
+    detail = ", ".join(
+        f"{name}={_engine_path(playwright, name) or '<not set>'}" for name in candidates
+    )
+
     try:
         for name in candidates:
             engine = getattr(playwright, name, None)
@@ -207,9 +215,6 @@ def first_available_browser(
             # We started this driver purely to read executable paths.
             _stop(playwright)
 
-    detail = ", ".join(
-        f"{name}={_engine_path(playwright, name) or '<not set>'}" for name in candidates
-    )
     raise BrowserNotInstalled(
         f"no Playwright browser is installed (checked {detail}); "
         f"run `{INSTALL_HINT}` to download one"

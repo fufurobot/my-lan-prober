@@ -164,6 +164,48 @@ def test_first_available_error_names_the_remedy(installed):
     assert "playwright install" in message
 
 
+def test_first_available_reports_real_paths_after_stopping_its_own_driver(monkeypatch):
+    """The diagnosis must survive the driver being shut down.
+
+    ``first_available_browser`` starts a driver itself when none is passed and
+    stops it again in a ``finally``.  A stopped driver raises on attribute
+    access, so reading ``executable_path`` *after* the stop downgrades every
+    line of the error to ``<not set>`` — losing exactly the information a user
+    needs.  The paths must be captured while the driver is still alive.
+    """
+
+    class StoppedDriver:
+        """Mimics Playwright: attribute access dies once stopped."""
+
+        def __init__(self):
+            self.stopped = False
+            for name in BROWSER_NAMES:
+                setattr(self, name, FakeBrowserType(name, f"C:/fake/{name}-binary"))
+
+        def stop(self):
+            self.stopped = True
+            for name in BROWSER_NAMES:
+                setattr(self, name, None)
+
+        def __getattr__(self, item):
+            if self.__dict__.get("stopped"):
+                raise RuntimeError("driver has been stopped")
+            raise AttributeError(item)
+
+    driver = StoppedDriver()
+    monkeypatch.setattr("my_lan_prober.browsers.playwright_object", lambda: driver)
+
+    with pytest.raises(BrowserNotInstalled) as excinfo:
+        first_available_browser()
+
+    assert driver.stopped is True, "the driver we started must be stopped"
+    message = str(excinfo.value)
+    assert "chromium=C:/fake/chromium-binary" in message, (
+        f"paths were lost after stopping the driver: {message}"
+    )
+    assert "<not set>" not in message
+
+
 # ---------------------------------------------------------------------------
 # The optional-dependency boundary
 # ---------------------------------------------------------------------------

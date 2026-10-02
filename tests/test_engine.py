@@ -273,3 +273,66 @@ def test_engine_runs_against_an_arp_style_lease_frame(config):
 
     assert list(result["ip_address"]) == ["192.168.1.1", "192.168.1.104"]
     assert "22:SSH" in result.iloc[1]["detected_services"]
+
+
+# ---------------------------------------------------------------------------
+# build_fetcher
+# ---------------------------------------------------------------------------
+def test_build_fetcher_passes_the_configured_browser_through(monkeypatch):
+    from my_lan_prober.engine import build_fetcher
+
+    monkeypatch.setenv("PW_BROWSER", "webkit")
+
+    assert build_fetcher("tplogin").browser == "webkit"
+
+
+def test_build_fetcher_auto_still_ends_at_the_local_arp_table(monkeypatch):
+    """``auto`` must keep a local source last, whatever the browser situation."""
+    from my_lan_prober.engine import build_fetcher
+    from my_lan_prober.fetchers import PlaywrightFetcher, UnixArpFetcher, WindowsArpFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": False, "firefox": False, "webkit": False}),
+    )
+
+    kinds = [type(fetcher) for fetcher in build_fetcher("auto").fetchers()]
+
+    assert kinds[0] is PlaywrightFetcher
+    assert UnixArpFetcher in kinds
+    assert kinds[-1] in (UnixArpFetcher, WindowsArpFetcher)
+
+
+def test_engine_falls_back_to_arp_when_no_browser_is_installed(monkeypatch, tmp_path):
+    """End to end: no browser at all still produces an enriched CSV.
+
+    ``fetch_leases`` is the default implementation here (not the stub), so
+    this exercises the real ``build_fetcher`` chain.
+    """
+    from my_lan_prober.engine import build_fetcher
+    from my_lan_prober.fetchers import PlaywrightFetcher, UnixArpFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": False, "firefox": False, "webkit": False}),
+    )
+    monkeypatch.setattr(
+        UnixArpFetcher,
+        "iptable",
+        lambda self: pd.DataFrame(
+            [{"ip": "192.168.1.9", "mac_address": "aa:bb:cc:dd:ee:ff", "mode": "arp"}]
+        ),
+    )
+
+    config = Config.resolve(
+        ["--fetcher", "auto", "--output", str(tmp_path / "out.csv"), "--resolve-host", "localhost"]
+    )
+    engine = StubEngine(config)
+    engine.fetch_leases = lambda: build_fetcher(config.fetcher).iptable()
+
+    result = engine.run()
+
+    assert list(result["ip_address"]) == ["192.168.1.9"]
+    assert (tmp_path / "out.csv").exists()

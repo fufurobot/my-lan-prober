@@ -301,3 +301,134 @@ def test_playwright_parse_html_normalises_the_lease_frame(tmp_path):
     assert set(frame["mode"]) == {"dhcp"}
     assert list(frame["ip"]) == ["192.168.1.104", "192.168.1.105"]
     assert frame.iloc[0]["mac_address"] == "08:62:66:b4:2c:d2"
+
+
+# ---------------------------------------------------------------------------
+# Browser availability: the gate that decides router-scrape vs local ARP
+# ---------------------------------------------------------------------------
+def test_playwright_fetcher_is_unavailable_when_no_browser_is_installed(monkeypatch):
+    """``pip install playwright`` does not install a browser.
+
+    Without one, launching is guaranteed to fail, so ``available()`` must say
+    so *before* the chain decides whether to try this source at all.
+    """
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": False, "firefox": False, "webkit": False}),
+    )
+
+    assert PlaywrightFetcher().available() is False
+
+
+def test_playwright_fetcher_is_available_when_any_browser_is_installed(monkeypatch):
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": False, "firefox": True, "webkit": False}),
+    )
+
+    assert PlaywrightFetcher().available() is True
+
+
+def test_playwright_fetcher_uses_the_first_installed_browser(monkeypatch):
+    """The engine is detected, not hard-coded to chromium."""
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": False, "firefox": True, "webkit": True}),
+    )
+
+    assert PlaywrightFetcher().browser_engine_name() == "firefox"
+
+
+def test_playwright_fetcher_prefers_an_explicit_browser_when_present(monkeypatch):
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": True, "firefox": True, "webkit": False}),
+    )
+
+    assert PlaywrightFetcher(browser="webkit").browser_engine_name() == "chromium"
+    assert PlaywrightFetcher(browser="firefox").browser_engine_name() == "firefox"
+
+
+def test_playwright_fetcher_rejects_a_requested_browser_that_is_missing(monkeypatch):
+    from my_lan_prober.browsers import BrowserNotInstalled
+
+    from my_lan_prober.fetchers import PlaywrightFetcher
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": True, "firefox": False, "webkit": False}),
+    )
+
+    with pytest.raises(BrowserNotInstalled):
+        PlaywrightFetcher(browser="webkit").browser_engine_name()
+
+
+# ---------------------------------------------------------------------------
+# Degrading to the local ARP table
+# ---------------------------------------------------------------------------
+class UnavailableFetcher(StubFetcher):
+    """A source that cannot run here at all (e.g. no browser installed)."""
+
+    def available(self):
+        return False
+
+
+def test_chain_skips_an_unavailable_source():
+    """An unavailable source is not called — not merely called and failed."""
+    good = StubFetcher(pd.DataFrame([{"ip": "10.0.0.9", "mode": "arp"}]))
+    missing = UnavailableFetcher(error=RuntimeError("should never be called"))
+
+    frame = (missing >> good).iptable()
+
+    assert list(frame["ip"]) == ["10.0.0.9"]
+    assert missing.calls == 0
+
+
+def test_chain_raises_when_every_source_is_unavailable():
+    chain = UnavailableFetcher() >> UnavailableFetcher()
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        chain.iptable()
+
+
+def test_local_arp_chain_is_the_no_browser_fallback(monkeypatch):
+    """No browser installed → the scan still gets a lease table.
+
+    This is the whole point of feature 2: the router's web UI is unreachable
+    without a browser, so the OS-independent local ARP table takes over
+    instead of the run dying.
+    """
+    from my_lan_prober.fetchers import (
+        PlaywrightFetcher,
+        UnixArpFetcher,
+        default_fetcher_chain,
+    )
+
+    monkeypatch.setattr(
+        PlaywrightFetcher,
+        "installed_browsers",
+        classmethod(lambda cls: {"chromium": False, "firefox": False, "webkit": False}),
+    )
+    arp_frame = pd.DataFrame(
+        [{"ip": "192.168.1.7", "mac_address": "aa:bb:cc:dd:ee:ff", "mode": "arp"}]
+    )
+    monkeypatch.setattr(UnixArpFetcher, "iptable", lambda self: arp_frame)
+
+    chain = default_fetcher_chain()
+    frame = chain.iptable()
+
+    assert list(frame["ip"]) == ["192.168.1.7"]
+    assert chain.fetchers()[0].available() is False

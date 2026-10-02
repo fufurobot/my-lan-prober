@@ -130,6 +130,42 @@ def test_log_level_env_is_picked_up(monkeypatch):
     assert Config.resolve([]).log_level == "DEBUG"
 
 
+# ---------------------------------------------------------------------------
+# Browser engine selection
+# ---------------------------------------------------------------------------
+def test_browser_defaults_to_none_meaning_auto_detect(monkeypatch):
+    """``None`` is "pick the first engine that exists", not "chromium"."""
+    monkeypatch.delenv("PW_BROWSER", raising=False)
+
+    assert Config.resolve([]).browser is None
+
+
+def test_browser_flag_selects_an_engine(monkeypatch):
+    monkeypatch.delenv("PW_BROWSER", raising=False)
+
+    assert Config.resolve(["--browser", "firefox"]).browser == "firefox"
+
+
+def test_browser_env_is_picked_up(monkeypatch):
+    monkeypatch.setenv("PW_BROWSER", "webkit")
+
+    assert Config.resolve([]).browser == "webkit"
+
+
+def test_browser_flag_overrides_the_env(monkeypatch):
+    monkeypatch.setenv("PW_BROWSER", "webkit")
+
+    assert Config.resolve(["--browser", "firefox"]).browser == "firefox"
+
+
+def test_browser_flag_rejects_an_unknown_engine(monkeypatch):
+    """Fail at argument parsing, not with Playwright's AttributeError."""
+    monkeypatch.delenv("PW_BROWSER", raising=False)
+
+    with pytest.raises(SystemExit):
+        Config.resolve(["--browser", "edge"])
+
+
 def test_port_timeout_is_also_the_connect_timeout(monkeypatch):
     monkeypatch.delenv("PORT_TIMEOUT", raising=False)
 

@@ -58,6 +58,11 @@ addopts = "-q --strict-markers -p no:cacheprovider"
 target-version = "py310"
 line-length = 100
 src = ["src", "tests"]
+# The standalone reference script the package was ported from is checked (it
+# must stay valid, runnable Python) but not linted: it deliberately mirrors the
+# original file's layout rather than the package's import-sorting and
+# modern-syntax rules.  `tests/test_reference_script.py` guards its substance.
+exclude = ["tplogin-minimal.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]

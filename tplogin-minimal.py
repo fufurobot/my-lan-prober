@@ -73,6 +73,9 @@ PING_TIMEOUT: int = 2
 # installed keeps behaving exactly as before.
 BROWSER_NAMES: Tuple[str, ...] = ("chromium", "firefox", "webkit")
 
+# ``auto`` is accepted as an explicit spelling of the default.
+BROWSER_CHOICES: Tuple[str, ...] = BROWSER_NAMES + ("auto",)
+
 # Command that downloads a missing browser binary.
 BROWSER_INSTALL_HINT: str = "playwright install"
 
@@ -126,16 +129,17 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--browser",
-        choices=BROWSER_NAMES,
+        choices=BROWSER_CHOICES,
         default=None,
         metavar="NAME",
         help=(
-            "Playwright browser engine to use when scraping the router. "
-            "Default: auto-detect the first engine that is installed ("
+            "Playwright browser engine to use when scraping the router, or "
+            "'auto' to detect the first installed engine ("
             + ", ".join(BROWSER_NAMES)
-            + "). Note that installing the Python package does not install a "
-            f"browser; run `{BROWSER_INSTALL_HINT}` for that. When no engine "
-            "is available at all, the scan falls back to the local ARP table."
+            + "). Default: auto. Note that installing the Python package does "
+            f"not install a browser; run `{BROWSER_INSTALL_HINT}` for that. "
+            "When no engine is available at all, the scan falls back to the "
+            "local ARP table."
         ),
     )
     return parser.parse_args(argv)
@@ -745,8 +749,9 @@ def is_browser_installed(browser_type: Any) -> bool:
     Whether one Playwright ``BrowserType`` has a binary that exists on disk.
 
     ``executable_path`` is ``""`` when Playwright has no binary for that
-    engine, and ``Path("")`` is the *current directory* — which exists — so
-    the emptiness check has to come first or every engine looks installed.
+    engine, and ``Path("").exists()`` is ``True`` — the empty path resolves to
+    the current directory — so the emptiness check has to come first or every
+    engine would look installed.
     """
     try:
         raw = browser_type.executable_path
@@ -793,9 +798,10 @@ def detect_browsers(playwright: Optional[Any] = None) -> Dict[str, bool]:
             raising.  "Cannot tell" must read as "not installed", because the
             caller's correct response is to fall back to the local ARP table.
     """
-    detected: Dict[str, bool] = {name: False for name in BROWSER_NAMES}
+    detected: Dict[str, bool] = dict.fromkeys(BROWSER_NAMES, False)
 
-    if playwright is None:
+    started = playwright is None
+    if started:
         try:
             import playwright as _playwright_package  # noqa: F401
 
@@ -814,10 +820,13 @@ def detect_browsers(playwright: Optional[Any] = None) -> Dict[str, bool]:
             if detected[name]:
                 log.debug("playwright engine %s is installed", name)
     finally:
-        stop = getattr(playwright, "stop", None)
-        if stop is not None:
-            with contextlib.suppress(Exception):
-                stop()
+        # Only stop a driver *we* started.  Shutting down a caller's driver
+        # would pull it out from under them.
+        if started:
+            stop = getattr(playwright, "stop", None)
+            if stop is not None:
+                with contextlib.suppress(Exception):
+                    stop()
 
     return detected
 
@@ -1225,7 +1234,11 @@ def run(
     # ------------------------------------------------------------------
     # 2. Router DHCP scrape, or the local ARP table when no browser exists
     # ------------------------------------------------------------------
-    df = fetch_leases(requested_browser=browser or os.environ.get("PW_BROWSER", "").strip() or None)
+    engine = (browser or os.environ.get("PW_BROWSER", "").strip() or None)
+    # "auto" is an explicit spelling of the default, not an engine name.
+    if engine is not None and engine.lower() == "auto":
+        engine = None
+    df = fetch_leases(requested_browser=engine)
 
     # ------------------------------------------------------------------
     # 3. ICMP ping check for each lease

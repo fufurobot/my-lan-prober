@@ -74,6 +74,27 @@ def test_the_reference_script_exposes_a_browser_flag(tree):
     assert "--browser" in fields
 
 
+def test_the_reference_script_accepts_the_documented_auto_value(source):
+    """``auto`` is the documented default, so it must parse, not be rejected."""
+    assert "BROWSER_CHOICES" in source
+    assert '"auto"' in source or "'auto'" in source
+
+
+def test_the_reference_script_stops_only_the_driver_it_started(source):
+    """Closing a caller's driver would pull it out from under them.
+
+    ``detect_browsers(playwright)`` accepts an existing driver, so the
+    shutdown in its ``finally`` must be conditional on having started it.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == "detect_browsers":
+            segment = ast.get_source_segment(source, node) or ""
+            assert "started = " in segment, "detect_browsers must track ownership"
+            assert "if started:" in segment, "must only stop a driver it started"
+            return
+    pytest.fail("detect_browsers not found in tplogin-minimal.py")
+
+
 # ---------------------------------------------------------------------------
 # Feature 2: the local ARP fallback
 # ---------------------------------------------------------------------------
@@ -93,6 +114,39 @@ def test_the_reference_script_has_a_local_arp_fallback(tree):
 def test_the_reference_fallback_covers_every_platform(source, marker):
     """One OS-independent path: procfs, then ip neigh, then arp -a/-an."""
     assert marker in source
+
+
+def test_the_reference_detect_browsers_leaves_a_caller_driver_running(tmp_path):
+    """Behavioural check, not just an AST one: the caller keeps their driver.
+
+    ``detect_browsers(existing)`` must inspect the driver it was handed and
+    leave it running; a shutting-down driver makes the *next* call fail.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_mlp_ref_script", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Engine:
+        def __init__(self, name, path):
+            self.name = name
+            self.executable_path = str(path)
+
+    class Driver:
+        def __init__(self):
+            self.stop_calls = 0
+            for name in module.BROWSER_NAMES:
+                setattr(self, name, Engine(name, tmp_path / f"{name}-bin"))
+
+        def stop(self):
+            self.stop_calls += 1
+
+    driver = Driver()
+    detected = module.detect_browsers(driver)
+
+    assert driver.stop_calls == 0, "detect_browsers stopped a caller's driver"
+    assert set(detected) == set(module.BROWSER_NAMES)
 
 
 def test_the_reference_script_imports_playwright_lazily(source):

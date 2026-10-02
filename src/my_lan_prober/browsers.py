@@ -68,9 +68,9 @@ def is_browser_installed(browser_type: Any) -> bool:
     """Whether one ``BrowserType`` has a binary that exists on disk.
 
     ``executable_path`` is ``""`` when Playwright has no binary for that
-    engine, and ``Path("")`` is the current directory — which *exists* — so
-    the emptiness check has to come first or every engine would look
-    installed.
+    engine, and ``Path("").exists()`` is ``True`` — the empty path resolves to
+    the current directory — so the emptiness check has to come first or every
+    engine would look installed.
     """
     try:
         raw = browser_type.executable_path

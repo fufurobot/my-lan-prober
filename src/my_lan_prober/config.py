@@ -23,9 +23,14 @@ __all__ = [
     "ensure_temp_env",
     "FETCHER_CHOICES",
     "BROWSER_NAMES",
+    "BROWSER_CHOICES",
 ]
 
 FETCHER_CHOICES = ("tplogin", "unix", "windows", "openwrt", "auto")
+
+#: ``auto`` is accepted as an explicit spelling of the default, so a user can
+#: write the behaviour the help text and `design.md` describe.
+BROWSER_CHOICES = (*BROWSER_NAMES, "auto")
 
 DEFAULT_OUTPUT = "data/tplogin-arp-enriched.csv"
 
@@ -156,15 +161,15 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--browser",
-        choices=BROWSER_NAMES,
+        choices=BROWSER_CHOICES,
         default=None,
         metavar="NAME",
         help=(
-            "Playwright browser engine to use. Default: auto-detect the first "
-            "engine that is installed ("
+            "Playwright browser engine to use, or 'auto' to detect the first "
+            "installed engine ("
             + ", ".join(BROWSER_NAMES)
-            + "). Installing the Python package does not install a browser; "
-            "run `playwright install` for that."
+            + "). Default: auto. Installing the Python package does not "
+            "install a browser; run `playwright install` for that."
         ),
     )
     return parser.parse_args(argv)
@@ -279,6 +284,9 @@ class Config:
         )
 
         browser = args.browser or os.environ.get("PW_BROWSER", "").strip() or None
+        # "auto" is an explicit spelling of the default, not an engine name.
+        if browser is not None and browser.lower() == "auto":
+            browser = None
 
         log_level = os.environ.get("PROBESTACK_LOG_LEVEL", "").strip().upper() or "INFO"
 

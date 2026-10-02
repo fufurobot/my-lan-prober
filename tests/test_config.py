@@ -166,6 +166,29 @@ def test_browser_flag_rejects_an_unknown_engine(monkeypatch):
         Config.resolve(["--browser", "edge"])
 
 
+def test_browser_auto_is_accepted_as_the_default(monkeypatch):
+    """`auto` is what the help text and design.md call the default.
+
+    Rejecting it with argparse's "invalid choice" would contradict the
+    documentation, so it is accepted and normalised to auto-detection.
+    """
+    monkeypatch.delenv("PW_BROWSER", raising=False)
+
+    assert Config.resolve(["--browser", "auto"]).browser is None
+
+
+def test_browser_env_auto_is_normalised(monkeypatch):
+    monkeypatch.setenv("PW_BROWSER", "auto")
+
+    assert Config.resolve([]).browser is None
+
+
+def test_browser_env_auto_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("PW_BROWSER", "AUTO")
+
+    assert Config.resolve([]).browser is None
+
+
 def test_port_timeout_is_also_the_connect_timeout(monkeypatch):
     monkeypatch.delenv("PORT_TIMEOUT", raising=False)
 

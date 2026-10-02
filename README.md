@@ -85,7 +85,7 @@ first-class abstractions for the things you keep re-implementing:
   in-memory if you skip it entirely.
 - 🧵 **One asyncio loop per process**, safely bridged to a sync API — no
   greenlets, no "sync API inside asyncio" errors.
-- 🧪 **Everything testable** — 328 tests; handlers, sessions, fetchers, and
+- 🧪 **Everything testable** — 335 tests; handlers, sessions, fetchers, and
   browser detection are independent and can be driven by hand.
 
 ## Architecture
@@ -260,7 +260,7 @@ print(frame[["host", "ip_address", "detected_services"]])
 | `--output PATH` | `OUTPUT_CSV` | `data/tplogin-arp-enriched.csv` | Unified output CSV |
 | `--fetcher {tplogin,unix,windows,openwrt,auto}` | `ARP_FETCHER` | `tplogin` | Preferred ARP source |
 | `--unsafe-tplogin-password PW` | `TPLOGIN_PASSWORD` | prompt | ⚠️ Non-interactive login — leaks to `ps` |
-| `--browser NAME` | `PW_BROWSER` | auto-detect | Playwright engine: `chromium`/`firefox`/`webkit` |
+| `--browser NAME` | `PW_BROWSER` | `auto` | Playwright engine: `auto`/`chromium`/`firefox`/`webkit` |
 
 **Precedence:** CLI flag > environment variable > default.
 

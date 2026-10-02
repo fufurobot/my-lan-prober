@@ -739,7 +739,7 @@ flowchart LR
 | `--output` | `OUTPUT_CSV` | `tplogin-arp-enriched.csv` |
 | `--fetcher` | `ARP_FETCHER` | `tplogin` |
 | `--unsafe-tplogin-password` | `TPLOGIN_PASSWORD` | prompt |
-| `--browser` | `PW_BROWSER` | auto |
+| `--browser` | `PW_BROWSER` | auto (first installed of chromium/firefox/webkit) |
 
 ```mermaid
 flowchart TD
@@ -811,8 +811,9 @@ sequenceDiagram
 | | `PicklePersistor`, `JSONLPersistor`, `SQLitePersistor`, `ArrowPlasmaPersistor` | ✘ | disk-backed |
 | **Bridge** | `AsyncBridge` | ✘ | `run(coro)` |
 | **Fetcher** | `ARPTableFetcher` | ✔ | `iptable*`, `<<`, `>>` |
-| | `PlaywrightFetcher` | ✔ | `run*`, `_prepare_env`, `_detect_latest_browser` |
-| | `TPLoginFetcher`, `UnixArpFetcher`, `WindowsArpFetcher`, `OpenWRTFetcher`, `FetcherChain` | mixed | per-source |
+| | `PlaywrightFetcher` | ✔ | `run*`, `driver_env`, `browser_engine_name` (was `_detect_latest_browser`) |
+| | `TPLoginFetcher`, `UnixArpFetcher`, `WindowsArpFetcher`, `OpenWRTFetcher`, `FetcherChain` | mixed | per-source; the chain skips `available() == False` |
+| **Browsers** | `detect_browsers`, `first_available_browser` | ✘ | probes `executable_path` per engine |
 | **App** | `Config`, `Engine` | ✘ | — |
 
 **Count:** ~70 protocols → **1 `TableSession` + ~8 overrides + 1 `LAYERS` dict**. No subclass explosion.

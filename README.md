@@ -30,6 +30,7 @@ script, now behind testable seams.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
+- [Browser detection](#browser-detection)
 - [Environment variables](#environment-variables)
 - [Extending my-lan-prober](#extending-my-lan-prober)
 - [Output](#output)
@@ -68,18 +69,24 @@ first-class abstractions for the things you keep re-implementing:
   and more.
 - 🏠 **DHCP lease scraping** with automatic source fallback: TP-Link
   (`tplogin.cn`) → local ARP table → OpenWRT over SSH.
+- 🎭 **Playwright browser auto-detection** — `pip install playwright` does
+  *not* install a browser, so the engine is chosen at run time by probing
+  `executable_path` for chromium, firefox and webkit, and the first installed
+  one is used. `--browser`/`PW_BROWSER` overrides it.
 - 🖥️ **OS-independent local ARP fallback** — tries `/proc/net/arp`, then
   `ip neigh`, then `arp -an`/`arp -a`, so it works on Linux, macOS, BSD, and
   Windows with no extra dependency. This is what you get when `tplogin.cn`
-  does *not* point at a TP-Link router.
+  does *not* point at a TP-Link router, **and** when no Playwright browser is
+  installed at all: the router's web UI is unreachable without a browser, so
+  the scan degrades to the neighbour table instead of failing.
 - 🎭 **Playwright fetcher** for routers with a web UI, replicating the tested
   login flow.
 - 💾 **Pluggable persistence** — Pickle, JSONL, SQLite, Arrow/Parquet; or
   in-memory if you skip it entirely.
 - 🧵 **One asyncio loop per process**, safely bridged to a sync API — no
   greenlets, no "sync API inside asyncio" errors.
-- 🧪 **Everything testable** — 267 tests; handlers, sessions, and fetchers are
-  independent and can be driven by hand.
+- 🧪 **Everything testable** — 328 tests; handlers, sessions, fetchers, and
+  browser detection are independent and can be driven by hand.
 
 ## Architecture
 
@@ -253,9 +260,50 @@ print(frame[["host", "ip_address", "detected_services"]])
 | `--output PATH` | `OUTPUT_CSV` | `data/tplogin-arp-enriched.csv` | Unified output CSV |
 | `--fetcher {tplogin,unix,windows,openwrt,auto}` | `ARP_FETCHER` | `tplogin` | Preferred ARP source |
 | `--unsafe-tplogin-password PW` | `TPLOGIN_PASSWORD` | prompt | ⚠️ Non-interactive login — leaks to `ps` |
-| `--browser NAME` | `PW_BROWSER` | `chromium` | Playwright browser engine |
+| `--browser NAME` | `PW_BROWSER` | auto-detect | Playwright engine: `chromium`/`firefox`/`webkit` |
 
 **Precedence:** CLI flag > environment variable > default.
+
+## Browser detection
+
+`pip install playwright` installs the Python driver and **no browser**. The
+binaries are a separate download:
+
+```bash
+playwright install            # all three engines
+playwright install firefox    # just one
+```
+
+Launching an engine whose binary is missing fails with *"Executable doesn't
+exist at …/ms-playwright/chromium-1243/…"*, so `my-lan-prober` never assumes
+chromium. It asks Playwright instead:
+
+```python
+from my_lan_prober import detect_browsers, first_available_browser
+
+detect_browsers()
+# {'chromium': False, 'firefox': True, 'webkit': False}
+
+first_available_browser()   # 'firefox'
+```
+
+Detection reads `browser_type.executable_path` — the attribute Playwright
+itself launches from — rather than guessing at the `ms-playwright` cache
+layout, which is versioned and private (`chromium-1243`, `firefox-1490`, …).
+
+If **no** engine is installed, the scan does not die. The router's web UI is
+unreachable without a browser, so the fetcher chain falls through to the
+local ARP table:
+
+```text
+WARNING  Cannot scrape the router with Playwright: no Playwright browser is
+         installed (chromium=no, firefox=no, webkit=no); run `playwright
+         install` to download one
+INFO     Local ARP table from `arp -a` (7 entries)
+```
+
+You get a real lease table — every host this machine has talked to — with no
+browser, no credentials, and no extra dependency.
 
 ## Environment variables
 
@@ -428,7 +476,19 @@ machine.
   multiplex. 79 protocols collapse to 8 framing strategies plus a data table.
 - **Local ARP is the fallback, not the default.** If `tplogin.cn` doesn't
   resolve to a TP-Link router, the chain falls through to the OS ARP table,
-  which needs no credentials and no extra dependency.
+  which needs no credentials and no extra dependency. The same fallback
+  catches the case where no Playwright browser is installed at all: the
+  router is unreachable without one, but the neighbour table is not.
+- **Unavailable sources are skipped, not called.** `FetcherChain` asks
+  `available()` before invoking a source, so "no browser installed" costs a
+  `False` rather than a raised `Error` that has to be caught and
+  interpreted. That distinction is what makes the degradation intentional
+  rather than accidental.
+- **"Cannot tell" means "not installed".** Playwright's driver is a child
+  process and can die on startup (on Windows, inside
+  `asyncio.windows_utils.pipe()`). Detection treats that as *no browser* so
+  the scan degrades, rather than letting an infrastructural failure decide
+  the outcome.
 
 ## Development
 
@@ -441,6 +501,13 @@ uv run pytest -q
 
 Tests are written test-first: each module's history has a `[WIP][RED]` commit
 that adds failing tests, followed by a `[GREEN]` commit that makes them pass.
+
+`tplogin-minimal.py` is the tested original the package was ported from, kept
+runnable as a reference. It is not imported by the suite — it is a script
+with side effects — but `tests/test_reference_script.py` parses it with `ast`
+and asserts it still compiles, still imports `playwright` lazily, and still
+carries both the browser detection and the local ARP fallback, so the
+reference cannot drift away from the package.
 
 ## License
 

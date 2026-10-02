@@ -244,4 +244,4 @@ build/
 .ci-venv
 
 # Transient commit-message scratch files
-.commit-msg.tmp
+.commit-msg*.tmp

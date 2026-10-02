@@ -1,0 +1,18 @@
+[WIP][RED] tests: the reference script must carry both new features
+
+`tplogin-minimal.py` is the tested original the package was ported from and
+is kept as a runnable reference, but nothing checked that it stays honest.
+These tests parse it with `ast` — it is never imported, since it is a script
+with side effects — and pin the properties that make it a useful reference:
+
+* it still compiles and still defines `run`, `scrape_router_dhcp`,
+  `parse_cli_args`;
+* feature 1: a `first_available_browser` helper that reads
+  `executable_path`, a `--browser` flag, and no hard-coded
+  `playwright.chromium.launch()`;
+* feature 2: a `local_arp_leases` fallback covering `/proc/net/arp`,
+  `ip neigh` and `arp -a`/`arp -an`;
+* `playwright` is imported lazily, because a module-level import would make
+  the script unrunnable exactly when the fallback is supposed to save it.
+
+9 failures, all for the intended reasons.

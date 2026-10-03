@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+
 from my_lan_prober.expanders import (
     ArpTableExpander,
     SSHArpTableExpander,
     SSHHopExpander,
     TableUnion,
 )
-
 from my_lan_prober.fetchers import ARPTableFetcher
 
 # ---------------------------------------------------------------------------
@@ -161,15 +161,16 @@ def test_expander_works_with_an_empty_upstream_table():
 # ---------------------------------------------------------------------------
 # Provenance — where a row came from is part of the row
 # ---------------------------------------------------------------------------
-def test_expander_records_the_source_of_every_row():
+def test_every_row_records_the_source_that_produced_it():
+    """Provenance survives the merge, and distinguishes derived rows."""
     frame = PrefixExpander(StubFetcher()).iptable()
 
-    assert set(frame["source"]) == {"PrefixExpander"}
+    assert frame[frame["ip"] == "192.168.1.1"].iloc[0]["source"] == "StubFetcher"
+    assert frame[frame["ip"] == "10.0.0.100"].iloc[0]["source"] == "PrefixExpander"
 
 
 def test_upstream_rows_keep_their_own_source_label():
     upstream = StubFetcher()
-    upstream.__class__.__name__ = "StubFetcher"
 
     frame = PrefixExpander(upstream).iptable()
 
@@ -178,9 +179,11 @@ def test_upstream_rows_keep_their_own_source_label():
 
 
 def test_expander_records_the_depth_of_the_expansion():
+    """Expanded rows carry the depth they were discovered at."""
     frame = PrefixExpander(StubFetcher()).iptable()
 
-    assert set(frame["depth"]) == {0, 1}
+    assert frame[frame["ip"] == "10.0.0.100"].iloc[0]["depth"] == 1
+    assert frame[frame["ip"] == "192.168.1.1"].iloc[0]["depth"] == 0
 
 
 def test_expander_deduplicates_rows_it_already_had():
@@ -336,30 +339,51 @@ def test_known_hosts_parsing_handles_a_missing_file(tmp_path):
     assert expander.known_hosts() == []
 
 
-def test_ssh_expander_probes_every_upstream_ip_through_ssh():
-    """The upstream table says *where*; SSH says *what else is behind it*."""
+def test_ssh_expander_probes_the_configured_hop():
+    """The named hop is the door; the upstream table says who is behind it."""
     probed = []
 
     def fake_probe(host, command, **kwargs):
         probed.append((host, command))
-        return "192.168.2.5  0x1  0x2  02:00:5e:00:00:01  *  eth0\n"
+        if host == "arch-server-main":
+            return "192.168.2.5  0x1  0x2  02:00:5e:00:00:01  *  eth0\n"
+        return ""
 
-    expander = SSHArpTableExpander(
-        StubFetcher(), hop="arch-server-main", probe=fake_probe, enabled=True
-    )
-
-    frame = expander.iptable()
+    frame = SSHArpTableExpander(
+        StubFetcher(), hop="arch-server-main", probe=fake_probe, enabled=True, max_depth=1
+    ).iptable()
 
     assert "192.168.2.5" in set(frame["ip"])
     assert {host for host, _command in probed} == {"arch-server-main"}
 
 
+def test_ssh_expander_probes_every_upstream_ip_through_ssh():
+    """With enough depth, the hosts the upstream table found are probed too."""
+    probed = []
+
+    def fake_probe(host, command, **kwargs):
+        probed.append(host)
+        return ""
+
+    SSHArpTableExpander(
+        StubFetcher(), hop="arch-server-main", probe=fake_probe, enabled=True, max_depth=2
+    ).iptable()
+
+    assert {"arch-server-main", "192.168.1.1", "192.168.1.104"} <= set(probed)
+
+
 def test_ssh_expander_reports_the_hop_as_provenance():
+    """The row says which machine it was seen from — the configured hop first.
+
+    The upstream table's own hosts are probed too (that is the expansion), so
+    a host several probes found accumulates every `via` that saw it.
+    """
+
     def fake_probe(host, command, **kwargs):
         return "192.168.2.5  0x1  0x2  02:00:5e:00:00:01  *  eth0\n"
 
     frame = SSHArpTableExpander(
-        StubFetcher(), hop="arch-server-main", probe=fake_probe, enabled=True
+        StubFetcher(), hop="arch-server-main", probe=fake_probe, enabled=True, max_depth=1
     ).iptable()
 
     row = frame[frame["ip"] == "192.168.2.5"].iloc[0]
@@ -373,8 +397,10 @@ def test_ssh_expander_is_unavailable_without_a_hop():
 def test_ssh_expander_reads_the_hop_from_the_environment(monkeypatch):
     monkeypatch.setenv("SSH_HOP", "arch-server-main")
 
-    expander = SSHArpTableExpander(StubFetcher())
+    expander = SSHArpTableExpander(StubFetcher(), enabled=True)
+    monkeypatch.setattr(expander, "_probe", lambda host, command=None, **kwargs: "")
 
+    assert expander.hop == "arch-server-main"
     assert expander.available() is True
 
 
@@ -514,12 +540,29 @@ def test_hop_expander_notes_which_hop_each_row_came_from():
     assert set(frame["via"]) == {"bastion", "target"}
 
 
+def test_hop_expander_records_every_hop_a_shared_host_was_seen_from():
+    """Two hops reporting the same host is one host, reachable two ways.
+
+    Collapsing them is right — it *is* one machine — but the row must still
+    say that both hops can see it, which is the whole reason for walking the
+    chain in the first place.
+    """
+    frame = SSHHopExpander(
+        ["bastion", "target"],
+        fetcher_for=lambda hop: StubFetcher(pd.DataFrame([{"ip": "10.0.0.1", "mode": "arp"}])),
+    ).iptable()
+
+    assert len(frame) == 1
+    assert set(str(frame.iloc[0]["via"]).split(",")) == {"bastion", "target"}
+
+
 def test_hop_expander_survives_a_hop_that_fails():
     def fetcher_for(hop):
         if hop == "jump":
             return StubFetcher(error=RuntimeError("hop down"))
-        return StubFetcher(pd.DataFrame([{"ip": "10.0.0.1", "mode": "arp"}]))
+        return StubFetcher(pd.DataFrame([{"ip": f"10.0.0.{len(hop)}", "mode": "arp"}]))
 
     frame = SSHHopExpander(["bastion", "jump", "target"], fetcher_for=fetcher_for).iptable()
 
     assert set(frame["via"]) == {"bastion", "target"}
+    assert len(frame) == 2

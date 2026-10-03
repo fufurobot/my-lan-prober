@@ -238,6 +238,7 @@ def test_the_same_host_from_two_sources_yields_one_row(monkeypatch, config, regi
     frame = StubEngine(config).fetch_leases()
 
     assert len(frame[frame["ip"] == "192.168.1.104"]) == 1
+    assert frame[frame["ip"] == "192.168.1.104"].iloc[0]["mac_address"] == "08:62:66:b4:2c:d2"
 
 
 # ---------------------------------------------------------------------------

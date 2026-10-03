@@ -286,9 +286,15 @@ def test_build_fetcher_passes_the_configured_browser_through(monkeypatch):
     assert build_fetcher("tplogin").browser == "webkit"
 
 
-def test_build_fetcher_auto_still_ends_at_the_local_arp_table(monkeypatch):
-    """``auto`` must keep a local source last, whatever the browser situation."""
+def test_build_fetcher_auto_merges_every_non_invasive_source(monkeypatch):
+    """``auto`` keeps its documented meaning: the local, non-invasive sources.
+
+    It is no longer a fallback *chain* — the sources are all consulted and their
+    tables merged, so it now returns a union rather than whichever source
+    happened to answer first.
+    """
     from my_lan_prober.engine import build_fetcher
+    from my_lan_prober.expanders import TableUnion
     from my_lan_prober.fetchers import PlaywrightFetcher, UnixArpFetcher, WindowsArpFetcher
 
     monkeypatch.setattr(
@@ -297,20 +303,24 @@ def test_build_fetcher_auto_still_ends_at_the_local_arp_table(monkeypatch):
         classmethod(lambda cls: {"chromium": False, "firefox": False, "webkit": False}),
     )
 
-    chain = build_fetcher("auto")
-    kinds = [type(fetcher) for fetcher in chain.fetchers()]
+    fetcher = build_fetcher("auto")
 
+    assert isinstance(fetcher, TableUnion)
     # TPLoginFetcher *is* the Playwright source, so isinstance is the right check.
-    assert isinstance(chain.fetchers()[0], PlaywrightFetcher)
-    assert UnixArpFetcher in kinds
-    assert kinds[-1] in (UnixArpFetcher, WindowsArpFetcher)
+    assert any(isinstance(source, PlaywrightFetcher) for source in fetcher.upstream)
+    assert any(isinstance(source, UnixArpFetcher) for source in fetcher.upstream)
+    assert any(
+        isinstance(source, (UnixArpFetcher, WindowsArpFetcher)) for source in fetcher.upstream
+    )
+    assert any(source.available() for source in fetcher.upstream)
 
 
 def test_engine_falls_back_to_arp_when_no_browser_is_installed(monkeypatch, tmp_path):
     """End to end: no browser at all still produces an enriched CSV.
 
-    ``fetch_leases`` is the default implementation here (not the stub), so
-    this exercises the real ``build_fetcher`` chain.
+    ``fetch_leases`` is the default implementation here (not the stub), so this
+    exercises the real ``build_fetcher`` path.  The local ARP table's host must
+    survive into the output even though other sources contributed too.
     """
     from my_lan_prober.engine import build_fetcher
     from my_lan_prober.fetchers import PlaywrightFetcher, UnixArpFetcher
@@ -336,5 +346,5 @@ def test_engine_falls_back_to_arp_when_no_browser_is_installed(monkeypatch, tmp_
 
     result = engine.run()
 
-    assert list(result["ip_address"]) == ["192.168.1.9"]
+    assert "192.168.1.9" in set(result["ip_address"])
     assert (tmp_path / "out.csv").exists()

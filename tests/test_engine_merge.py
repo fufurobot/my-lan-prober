@@ -16,6 +16,7 @@ import pytest
 
 from my_lan_prober.config import Config
 from my_lan_prober.engine import Engine, build_fetcher
+from my_lan_prober.fetchers import ARPTableFetcher
 
 TPLOGIN_LEASES = pd.DataFrame(
     [
@@ -37,33 +38,35 @@ DNS_ROWS = pd.DataFrame([{"ip": "127.0.0.1", "mac_address": None, "mode": "dns"}
 HOSTS_ROWS = pd.DataFrame([{"ip": "192.168.1.77", "mac_address": None, "mode": "hosts"}])
 
 
+class TableFetcher(ARPTableFetcher):
+    """A fetcher that just returns a prepared table (or raises)."""
+
+    def __init__(self, frame=None, error=None):
+        self._frame = frame if frame is not None else pd.DataFrame(columns=["ip", "mode"])
+        self._error = error
+        self.calls = 0
+
+    def iptable(self):
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._frame.copy()
+
+
 @pytest.fixture
 def registry(monkeypatch):
     """A registry whose sources are all local, deterministic tables."""
     from my_lan_prober.registry import FetcherRegistry
 
-    class Fake(Engine.__mro__[0]):  # placeholder to keep ruff quiet about shadowing
-        pass
-
-    class TableFetcher:
-        def __init__(self, frame):
-            self._frame = frame
-
-        def iptable(self):
-            return self._frame.copy()
-
-        def available(self):
-            return True
-
     built = FetcherRegistry()
     built.register("tplogin", lambda **kw: TableFetcher(TPLOGIN_LEASES))
     built.register("unix", lambda **kw: TableFetcher(LOCAL_ARP))
-    built.register("windows", lambda **kw: TableFetcher(pd.DataFrame(columns=["ip", "mode"])))
+    built.register("windows", lambda **kw: TableFetcher())
     built.register("dns", lambda **kw: TableFetcher(DNS_ROWS))
     built.register("hosts", lambda **kw: TableFetcher(HOSTS_ROWS))
-    built.register("resolved", lambda **kw: TableFetcher(pd.DataFrame(columns=["ip", "mode"])))
-    built.register("openwrt", lambda **kw: TableFetcher(pd.DataFrame(columns=["ip", "mode"])))
-    built.register("ssh", lambda **kw: TableFetcher(pd.DataFrame(columns=["ip", "mode"])))
+    built.register("resolved", lambda **kw: TableFetcher())
+    built.register("openwrt", lambda **kw: TableFetcher())
+    built.register("ssh", lambda **kw: TableFetcher())
     return built
 
 
@@ -113,23 +116,14 @@ def test_all_mode_uses_every_registered_source(monkeypatch, config, registry):
 
 def test_auto_mode_does_not_reach_an_ssh_hop_by_default(monkeypatch, config, registry):
     """``auto`` must stay non-invasive."""
-    called = []
-
-    class Noisy:
-        def iptable(self):
-            called.append("ssh")
-            return pd.DataFrame(columns=["ip", "mode"])
-
-        def available(self):
-            return True
-
-    registry.register("ssh", lambda **kw: Noisy())
+    noisy = TableFetcher()
+    registry.register("ssh", lambda **kw: noisy)
     monkeypatch.setattr("my_lan_prober.engine.default_fetcher_registry", lambda: registry)
     config.fetcher = "auto"
 
     StubEngine(config).fetch_leases()
 
-    assert called == []
+    assert noisy.calls == 0
 
 
 def test_engine_records_which_source_each_host_came_from(monkeypatch, config, registry):
@@ -143,14 +137,9 @@ def test_engine_records_which_source_each_host_came_from(monkeypatch, config, re
 
 
 def test_engine_still_works_when_one_source_raises(monkeypatch, config, registry):
-    class Broken:
-        def iptable(self):
-            raise RuntimeError("router unreachable")
-
-        def available(self):
-            return True
-
-    registry.register("tplogin", lambda **kw: Broken())
+    registry.register(
+        "tplogin", lambda **kw: TableFetcher(error=RuntimeError("router unreachable"))
+    )
     monkeypatch.setattr("my_lan_prober.engine.default_fetcher_registry", lambda: registry)
     config.fetcher = "tplogin,unix"
 
@@ -160,15 +149,8 @@ def test_engine_still_works_when_one_source_raises(monkeypatch, config, registry
 
 
 def test_engine_raises_when_every_source_fails(monkeypatch, config, registry):
-    class Broken:
-        def iptable(self):
-            raise RuntimeError("down")
-
-        def available(self):
-            return True
-
     for name in registry.names():
-        registry.register(name, lambda **kw: Broken())
+        registry.register(name, lambda **kw: TableFetcher(error=RuntimeError("down")))
     monkeypatch.setattr("my_lan_prober.engine.default_fetcher_registry", lambda: registry)
     config.fetcher = "unix"
 
@@ -207,20 +189,9 @@ def test_merged_frame_keeps_the_lease_columns(monkeypatch, config, registry):
 
 def test_the_same_host_from_two_sources_yields_one_row(monkeypatch, config, registry):
     """The router and the local ARP table both know 192.168.1.104."""
-
-    class Both:
-        def __init__(self, frame):
-            self._frame = frame
-
-        def iptable(self):
-            return self._frame.copy()
-
-        def available(self):
-            return True
-
     registry.register(
         "unix",
-        lambda **kw: Both(
+        lambda **kw: TableFetcher(
             pd.DataFrame(
                 [
                     {

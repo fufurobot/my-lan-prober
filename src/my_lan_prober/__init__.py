@@ -14,6 +14,10 @@ The package is layered:
 ``handlers``    parsing + dispatch, composable with ``<<`` / ``>>`` / ``+=``
 ``persistors``  optional storage for parsed packets
 ``fetchers``    DHCP/ARP sources, including TP-Link over Playwright
+``fqdn``        one type for anything reachable: MAC, IPv4, IPv6, name, hop chain
+``dnsfetchers`` name-resolution sources: the hosts file, and DNS
+``expanders``   fetchers that grow other fetchers' tables (the SSH walk)
+``registry``    every implemented source, addressable by name
 ``probes``      port probing and service identification
 ``config``      CLI > environment > default for every knob
 ``engine``      the end-to-end pipeline
@@ -33,7 +37,20 @@ from .browsers import (
     is_browser_installed,
 )
 from .config import Config, ensure_temp_env, parse_cli_args
-from .engine import Engine, write_ssh_config
+from .dnsfetchers import (
+    DnsTableFetcher,
+    HostsFileFetcher,
+    ResolvedHostFetcher,
+    parse_hosts_entries,
+    resolve_names,
+)
+from .engine import Engine, build_fetcher, build_fetchers, write_ssh_config
+from .expanders import (
+    ArpTableExpander,
+    SSHArpTableExpander,
+    SSHHopExpander,
+    TableUnion,
+)
 from .fetchers import (
     ARPTableFetcher,
     FetcherChain,
@@ -43,6 +60,15 @@ from .fetchers import (
     UnixArpFetcher,
     WindowsArpFetcher,
     default_fetcher_chain,
+    merge_tables,
+)
+from .fqdn import (
+    FQDN,
+    KIND_HOSTNAME,
+    KIND_IPV4,
+    KIND_IPV6,
+    KIND_MAC,
+    KIND_UNKNOWN,
 )
 from .framing import (
     DatagramFraming,
@@ -74,6 +100,7 @@ from .persistors import (
     SQLitePersistor,
 )
 from .probes import COMMON_PORTS, ServiceIdentifier, icmp_ping, probe_service
+from .registry import FETCHER_REGISTRY, FetcherRegistry, default_fetcher_registry
 from .sessions import (
     AsyncSession,
     AsyncSocketSession,
@@ -101,11 +128,37 @@ __all__ = [
     "ARPTableFetcher",
     "FetcherChain",
     "default_fetcher_chain",
+    "merge_tables",
     "TPLoginFetcher",
     "PlaywrightFetcher",
     "UnixArpFetcher",
     "WindowsArpFetcher",
     "OpenWRTFetcher",
+    # fqdn
+    "FQDN",
+    "KIND_IPV4",
+    "KIND_IPV6",
+    "KIND_MAC",
+    "KIND_HOSTNAME",
+    "KIND_UNKNOWN",
+    # expanders
+    "ArpTableExpander",
+    "SSHArpTableExpander",
+    "SSHHopExpander",
+    "TableUnion",
+    # name-resolution sources
+    "DnsTableFetcher",
+    "HostsFileFetcher",
+    "ResolvedHostFetcher",
+    "parse_hosts_entries",
+    "resolve_names",
+    # registry
+    "FetcherRegistry",
+    "FETCHER_REGISTRY",
+    "default_fetcher_registry",
+    # engine helpers
+    "build_fetcher",
+    "build_fetchers",
     # browsers
     "BROWSER_NAMES",
     "BrowserNotInstalled",

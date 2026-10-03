@@ -24,17 +24,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from .config import Config
-from .fetchers import (
-    TPLoginFetcher,
-    UnixArpFetcher,
-    WindowsArpFetcher,
-    default_fetcher_chain,
-)
+from .expanders import SSHArpTableExpander, TableUnion
 from .probes import ServiceIdentifier, icmp_ping, probe_service
+from .registry import default_fetcher_registry
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Engine", "write_ssh_config", "build_fetcher"]
+__all__ = ["Engine", "write_ssh_config", "build_fetcher", "build_fetchers"]
 
 #: SSH ports tried in priority order when writing the helper script.
 SSH_PORT_CANDIDATES = (22, 2222, 8022)
@@ -106,24 +102,55 @@ def write_ssh_config(
     return config_path
 
 
-def build_fetcher(kind: str, browser: Optional[str] = None) -> Any:
-    """Instantiate the requested ARP source.
+def build_fetcher(
+    kind: str,
+    browser: Optional[str] = None,
+    *,
+    ssh_hop: Optional[str] = None,
+    expand: bool = False,
+    expand_depth: int = 1,
+) -> Any:
+    """Build the ARP source(s) named by ``kind``.
 
-    ``browser`` names the Playwright engine to use; ``None`` auto-detects the
-    first engine this machine actually has installed.
+    ``kind`` is a registry selection: one name (``unix``), several
+    (``unix,dns,hosts``), ``all`` for every implemented source, or ``auto`` for
+    the non-invasive set.  Anything but a single name comes back as a
+    :class:`~my_lan_prober.expanders.TableUnion`, because the engine's contract
+    is now "every selected source contributes" rather than "the first one that
+    answers wins".
     """
-    if kind == "tplogin":
-        return TPLoginFetcher(browser=browser)
-    if kind == "unix":
-        return UnixArpFetcher()
-    if kind == "windows":
-        return WindowsArpFetcher()
-    if kind == "openwrt":
-        from .fetchers import OpenWRTFetcher
+    registry = default_fetcher_registry()
+    selection = registry.parse_selection(kind)
 
-        return OpenWRTFetcher()
-    # "auto"/anything else: router first, then the local table.
-    return default_fetcher_chain(browser=browser)
+    kwargs = {
+        "browser": browser,
+        "ssh_hop": ssh_hop,
+        "expand": expand,
+        "expand_depth": expand_depth,
+    }
+    fetchers = [registry.create(name, **kwargs) for name in selection]
+
+    if len(fetchers) == 1:
+        return fetchers[0]
+    return TableUnion(fetchers)
+
+
+def build_fetchers(config: Config) -> List[Any]:
+    """Every source the run should consult, in registry order.
+
+    Kept separate from :func:`build_fetcher` because the engine's SSH expansion
+    needs the *list*: the expander's upstream is whatever the other selected
+    sources produced, which is only knowable once they have all been built.
+    """
+    registry = default_fetcher_registry()
+    selection = registry.parse_selection(config.fetcher)
+    kwargs = {
+        "browser": config.browser,
+        "ssh_hop": config.ssh_hop,
+        "expand": config.expand,
+        "expand_depth": config.expand_depth,
+    }
+    return [registry.create(name, **kwargs) for name in selection]
 
 
 class Engine:
@@ -150,7 +177,55 @@ class Engine:
         return probe_service(ip, port, timeout=self.config.port_timeout)
 
     def fetch_leases(self) -> pd.DataFrame:
-        return build_fetcher(self.config.fetcher, browser=self.config.browser).iptable()
+        """Every selected source's table, merged into one.
+
+        The merge happens *before* a single port is probed, which is the point:
+        a host only the hosts file knows about, or only a resolver knows about,
+        or only an SSH hop can see, is probed exactly like a DHCP lease.  The
+        old behaviour — take the first non-empty table and stop — silently
+        discarded every host the other sources had found.
+        """
+        fetchers = build_fetchers(self.config)
+
+        if self.config.expand:
+            fetchers = self._with_ssh_expansion(fetchers)
+
+        if not fetchers:
+            raise RuntimeError("no ARP source was selected")
+
+        union = TableUnion(fetchers)
+        frame = union.iptable()
+        log.info(
+            "ARP table: %d host(s) from %s",
+            len(frame),
+            ", ".join(sorted({str(name) for name in frame.get("source", [])})) or "no source",
+        )
+        return frame
+
+    def _with_ssh_expansion(self, fetchers: List[Any]) -> List[Any]:
+        """Add the SSH walk, with the other sources as its upstream.
+
+        The expander is appended rather than wrapped: the union then holds the
+        plain tables *and* the expansion, so a hop that fails still leaves the
+        direct sources intact instead of taking them down with it.
+        """
+        direct = [fetcher for fetcher in fetchers if not isinstance(fetcher, SSHArpTableExpander)]
+        already = [fetcher for fetcher in fetchers if isinstance(fetcher, SSHArpTableExpander)]
+        if already:
+            return fetchers
+
+        expander = SSHArpTableExpander(
+            direct or fetchers,
+            hop=self.config.ssh_hop,
+            enabled=True,
+            max_depth=self.config.expand_depth,
+        )
+        log.info(
+            "SSH expansion enabled (hop=%s, depth=%d)",
+            self.config.ssh_hop or "<from known_hosts>",
+            self.config.expand_depth,
+        )
+        return [*fetchers, expander]
 
     def identify(self, banner: Optional[str], port: int, ip: Optional[str] = None):
         return self.identifier.identify(banner, port, ip=ip)

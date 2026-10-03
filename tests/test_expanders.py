@@ -216,6 +216,28 @@ def test_expander_is_available_iff_any_upstream_is():
     assert PrefixExpander([Unavailable(), StubFetcher()]).available() is True
 
 
+def test_expander_calls_each_upstream_exactly_once():
+    """A fetcher can have side effects: a scrape logs in, a probe connects.
+
+    ``iptable`` merges the upstream tables and then decides what to expand, so
+    a naive implementation reads them twice — and for the Playwright source
+    that means logging into the router twice per run.
+    """
+    upstream = StubFetcher()
+
+    PrefixExpander(upstream).iptable()
+
+    assert upstream.calls == 1
+
+
+def test_table_union_calls_each_upstream_exactly_once():
+    upstream = StubFetcher()
+
+    TableUnion([upstream]).iptable()
+
+    assert upstream.calls == 1
+
+
 # ---------------------------------------------------------------------------
 # TableUnion — the merged "all fetchers" table
 # ---------------------------------------------------------------------------

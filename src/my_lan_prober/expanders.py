@@ -142,7 +142,14 @@ class ArpTableExpander(ARPTableFetcher):
 
     # -- upstream handling ---------------------------------------------
     def upstream_tables(self) -> List[tuple]:
-        """Every upstream table that could be fetched, with the fetcher it came from."""
+        """Every upstream table that could be fetched, with the fetcher it came from.
+
+        Called once per :meth:`iptable`, and the *only* place an upstream is
+        actually invoked: a caller that needs the tables twice (to merge them
+        and to inspect them) must hold on to the result rather than calling
+        again, because a fetcher can have side effects — a Playwright scrape
+        logs into the router, an SSH probe opens a connection.
+        """
         tables: List[tuple] = []
         for fetcher in self.upstream:
             if not _is_available(fetcher):
@@ -330,9 +337,12 @@ class TableUnion(ArpTableExpander):
                 + ", ".join(type(fetcher).__name__ for fetcher in self.upstream)
             )
 
+        # Reuse the tables already fetched above, never call the upstreams
+        # again: fetching is where the side effects live (a Playwright scrape
+        # logs into the router, an SSH probe opens a connection).
         tagged = [
             _tag(table, source=type(fetcher).__name__, depth=_depth_of(table))
-            for fetcher, table in self.upstream_tables()
+            for fetcher, table in tables
         ]
         merged = merge_tables(tagged)
         log.info(

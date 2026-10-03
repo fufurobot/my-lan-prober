@@ -19,6 +19,7 @@ import pytest
 from my_lan_prober.fetchers import ARPTableFetcher
 from my_lan_prober.registry import FETCHER_REGISTRY, FetcherRegistry, default_fetcher_registry
 
+
 # ---------------------------------------------------------------------------
 # Register / look up
 # ---------------------------------------------------------------------------

@@ -98,7 +98,7 @@ def test_the_public_api_does_not_import_optional_dependencies():
     """``import my_lan_prober`` must work with no extras installed."""
     import importlib.util
 
-    source = (Path(__file__).resolve().parent.parent / "src" / "my_lan_prober" / "__init__.py")
+    source = Path(__file__).resolve().parent.parent / "src" / "my_lan_prober" / "__init__.py"
     text = source.read_text(encoding="utf-8")
 
     for module in ("playwright", "asyncssh", "zeroconf", "openai"):

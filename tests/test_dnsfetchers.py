@@ -74,9 +74,7 @@ def test_parse_hosts_entries_uses_the_first_name_as_the_hostname():
 
 
 def test_parse_hosts_entries_skips_comments_and_blanks():
-    frame = parse_hosts_entries(
-        [FakeEntry("comment", None, None), FakeEntry("blank", None, None)]
-    )
+    frame = parse_hosts_entries([FakeEntry("comment", None, None), FakeEntry("blank", None, None)])
 
     assert frame.empty
     assert "ip" in frame.columns
@@ -145,9 +143,7 @@ class FakeResolver:
             import dns.resolver
 
             raise dns.resolver.NXDOMAIN(name)
-        values = [
-            _Record(value) for value in self._answers[name] if _wants(rdtype, value)
-        ]
+        values = [_Record(value) for value in self._answers[name] if _wants(rdtype, value)]
         if not values:
             import dns.resolver
 

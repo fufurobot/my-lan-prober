@@ -229,9 +229,7 @@ def test_table_union_deduplicates_the_same_host_seen_twice():
     """Two sources seeing one host is one host, enriched — not two rows."""
     from_dns = StubFetcher(pd.DataFrame([{"ip": "192.168.1.104", "mode": "dns"}]))
     from_arp = StubFetcher(
-        pd.DataFrame(
-            [{"ip": "192.168.1.104", "mac_address": "08:62:66:b4:2c:d2", "mode": "arp"}]
-        )
+        pd.DataFrame([{"ip": "192.168.1.104", "mac_address": "08:62:66:b4:2c:d2", "mode": "arp"}])
     )
 
     frame = TableUnion([from_dns, from_arp]).iptable()
@@ -419,6 +417,7 @@ def test_ssh_expander_recurses_into_hosts_it_discovers():
 
 def test_ssh_expander_stops_at_the_depth_limit():
     """A cycle between two hops must terminate, not spin forever."""
+
     def fake_probe(host, command, **kwargs):
         return "10.0.0.9  0x1  0x2  02:00:5e:00:00:02  *  eth0\n"
 

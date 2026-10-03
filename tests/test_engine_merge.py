@@ -30,15 +30,11 @@ TPLOGIN_LEASES = pd.DataFrame(
     ]
 )
 
-LOCAL_ARP = pd.DataFrame(
-    [{"ip": "192.168.1.1", "mac_address": "48:5f:08:9b:22:c5", "mode": "arp"}]
-)
+LOCAL_ARP = pd.DataFrame([{"ip": "192.168.1.1", "mac_address": "48:5f:08:9b:22:c5", "mode": "arp"}])
 
 DNS_ROWS = pd.DataFrame([{"ip": "127.0.0.1", "mac_address": None, "mode": "dns"}])
 
-HOSTS_ROWS = pd.DataFrame(
-    [{"ip": "192.168.1.77", "mac_address": None, "mode": "hosts"}]
-)
+HOSTS_ROWS = pd.DataFrame([{"ip": "192.168.1.77", "mac_address": None, "mode": "hosts"}])
 
 
 @pytest.fixture
@@ -180,9 +176,7 @@ def test_engine_raises_when_every_source_fails(monkeypatch, config, registry):
         StubEngine(config).fetch_leases()
 
 
-def test_running_the_engine_probes_hosts_found_by_secondary_sources(
-    monkeypatch, config, registry
-):
+def test_running_the_engine_probes_hosts_found_by_secondary_sources(monkeypatch, config, registry):
     """The point of merging: a DNS-only host is still port-probed."""
     probed = []
 
@@ -213,6 +207,7 @@ def test_merged_frame_keeps_the_lease_columns(monkeypatch, config, registry):
 
 def test_the_same_host_from_two_sources_yields_one_row(monkeypatch, config, registry):
     """The router and the local ARP table both know 192.168.1.104."""
+
     class Both:
         def __init__(self, frame):
             self._frame = frame

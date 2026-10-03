@@ -243,5 +243,8 @@ build/
 .ci-log-*.txt
 .ci-venv
 
+# Local GitHub API probe helper (it reads GITHUB_TOKEN from .env)
+.gh_probe.py
+
 # Transient commit-message scratch files
 .commit-*.tmp

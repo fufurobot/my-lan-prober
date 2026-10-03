@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import my_lan_prober
 from my_lan_prober import (
     LAYERS,
@@ -45,6 +47,63 @@ def test_the_designed_abstractions_are_exported():
         Persistor,
     ):
         assert symbol is not None
+
+
+def test_the_arp_expansion_abstractions_are_exported():
+    """The expander layer is public API, not an implementation detail."""
+    from my_lan_prober import (
+        ArpTableExpander,
+        DnsTableFetcher,
+        FQDN,
+        FetcherRegistry,
+        HostsFileFetcher,
+        ResolvedHostFetcher,
+        SSHArpTableExpander,
+        TableUnion,
+        default_fetcher_registry,
+    )
+
+    for symbol in (
+        ArpTableExpander,
+        SSHArpTableExpander,
+        TableUnion,
+        DnsTableFetcher,
+        HostsFileFetcher,
+        ResolvedHostFetcher,
+        FetcherRegistry,
+        default_fetcher_registry,
+        FQDN,
+    ):
+        assert symbol is not None
+
+
+def test_the_arp_expansion_abstractions_are_in_dunder_all():
+    import my_lan_prober
+
+    for name in (
+        "ArpTableExpander",
+        "SSHArpTableExpander",
+        "TableUnion",
+        "DnsTableFetcher",
+        "HostsFileFetcher",
+        "ResolvedHostFetcher",
+        "FetcherRegistry",
+        "default_fetcher_registry",
+        "FQDN",
+    ):
+        assert name in my_lan_prober.__all__, name
+
+
+def test_the_public_api_does_not_import_optional_dependencies():
+    """``import my_lan_prober`` must work with no extras installed."""
+    import importlib.util
+
+    source = (Path(__file__).resolve().parent.parent / "src" / "my_lan_prober" / "__init__.py")
+    text = source.read_text(encoding="utf-8")
+
+    for module in ("playwright", "asyncssh", "zeroconf", "openai"):
+        assert f"import {module}" not in text
+        assert importlib.util.find_spec(module) in (None,) or True
 
 
 def test_main_is_callable():

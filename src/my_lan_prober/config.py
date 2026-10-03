@@ -26,13 +26,28 @@ __all__ = [
     "BROWSER_CHOICES",
 ]
 
-FETCHER_CHOICES = ("tplogin", "unix", "windows", "openwrt", "auto")
+FETCHER_CHOICES = (
+    "tplogin",
+    "unix",
+    "windows",
+    "openwrt",
+    "hosts",
+    "dns",
+    "resolved",
+    "ssh",
+    "all",
+    "auto",
+)
 
 #: ``auto`` is accepted as an explicit spelling of the default, so a user can
 #: write the behaviour the help text and `design.md` describe.
 BROWSER_CHOICES = (*BROWSER_NAMES, "auto")
 
 DEFAULT_OUTPUT = "data/tplogin-arp-enriched.csv"
+
+#: Default bound on the SSH expansion walk: how many neighbour tables it
+#: collects.  One is "just the hop I named"; more follows what that hop saw.
+DEFAULT_EXPAND_DEPTH = 2
 
 #: Variables every child process consults, in Playwright's own priority order.
 TEMP_ENV_VARS: Sequence[str] = ("TMPDIR", "TMP", "TEMP")
@@ -102,6 +117,33 @@ def ensure_temp_env(base_dir: Optional[Path] = None) -> Optional[Path]:
     return None
 
 
+def _fetcher_selection(raw: str) -> str:
+    """Validate a ``--fetcher`` value without importing the registry eagerly.
+
+    The value is a *set* of sources, so argparse's ``choices=`` cannot express
+    it.  Validation happens here so a typo fails at argument parsing, with the
+    list of known names, rather than deep inside a scan.
+    """
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("--fetcher needs at least one source name")
+
+    modes = {"auto", "all"}
+    unknown = [name for name in names if name not in FETCHER_CHOICES and name not in modes]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown ARP source {', '.join(repr(name) for name in unknown)}; "
+            f"known sources: {', '.join(FETCHER_CHOICES)}"
+        )
+    # A mode and a name in one selection would be ambiguous ("all,unix"), and
+    # commas are how the modes are told apart from names, so they are exclusive.
+    if len(names) > 1 and any(name in modes for name in names):
+        raise argparse.ArgumentTypeError(
+            f"'auto' and 'all' must be used alone, not mixed with source names: {raw!r}"
+        )
+    return ",".join(names)
+
+
 def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -145,9 +187,39 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--fetcher",
-        choices=FETCHER_CHOICES,
+        type=_fetcher_selection,
         default=None,
-        help="Preferred source of the LAN address table.",
+        metavar="NAME[,NAME...]",
+        help=(
+            "ARP source(s) to consult, comma-separated, or 'all' for every "
+            "implemented source, or 'auto' for the non-invasive set. "
+            f"Known: {', '.join(FETCHER_CHOICES)}. Default: tplogin."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-hop",
+        default=None,
+        metavar="HOST",
+        help=("SSH host to expand through: its neighbour table is read and merged. Env: SSH_HOP."),
+    )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        default=None,
+        help=(
+            "Enable ARP expansion (the SSH walk). Off by default: logging "
+            "into other machines is invasive. Env: ARP_EXPAND."
+        ),
+    )
+    parser.add_argument(
+        "--expand-depth",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "How many neighbour tables the SSH walk collects. Default: "
+            f"{DEFAULT_EXPAND_DEPTH}. Env: ARP_EXPAND_DEPTH."
+        ),
     )
     parser.add_argument(
         "--unsafe-tplogin-password",
@@ -222,6 +294,18 @@ def _env_list(name: str, default: List[str]) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _env_flag(name: str) -> bool:
+    """Whether a boolean environment variable is switched on.
+
+    Accepts the spellings people actually write in a shell or a ``.env`` file
+    (``1``, ``true``, ``yes``, ``on``) and treats anything else — including a
+    variable that is merely present — as off, so ``ARP_EXPAND=0`` means what it
+    says rather than "set, therefore true".
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Config:
     """Every runtime knob, fully resolved."""
@@ -235,6 +319,12 @@ class Config:
     browser: Optional[str] = None
     log_level: str = "INFO"
     ports: List[int] = field(default_factory=lambda: list(COMMON_PORTS))
+    #: SSH host to expand the ARP table through (``--ssh-hop``/``SSH_HOP``).
+    ssh_hop: Optional[str] = None
+    #: Whether expansion is switched on at all (``--expand``/``ARP_EXPAND``).
+    expand: bool = False
+    #: How many neighbour tables the expansion walk collects.
+    expand_depth: int = DEFAULT_EXPAND_DEPTH
 
     #: Kept out of ``repr`` so a logged config never leaks the password.
     _SECRET_FIELDS = ("password",)
@@ -290,6 +380,14 @@ class Config:
 
         log_level = os.environ.get("PROBESTACK_LOG_LEVEL", "").strip().upper() or "INFO"
 
+        ssh_hop = args.ssh_hop or os.environ.get("SSH_HOP", "").strip() or None
+
+        expand = bool(args.expand) or _env_flag("ARP_EXPAND")
+
+        expand_depth = args.expand_depth or _env_int("ARP_EXPAND_DEPTH") or DEFAULT_EXPAND_DEPTH
+        if expand_depth < 1:
+            expand_depth = 1
+
         return cls(
             port_timeout=port_timeout,
             workers=workers,
@@ -299,4 +397,7 @@ class Config:
             password=password,
             browser=browser,
             log_level=log_level,
+            ssh_hop=ssh_hop,
+            expand=expand,
+            expand_depth=expand_depth,
         )

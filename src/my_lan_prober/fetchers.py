@@ -37,6 +37,7 @@ __all__ = [
     "OpenWRTFetcher",
     "FetcherChain",
     "default_fetcher_chain",
+    "merge_tables",
     "parse_windows_arp",
     "parse_proc_net_arp",
     "parse_ip_neigh",
@@ -96,6 +97,176 @@ def _frame(rows: List[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["ip", "mac_address", "mode"])
     return pd.DataFrame(rows)
+
+
+def _validate_frame(frame: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Check a fetcher's result, from outside the class as well as inside.
+
+    Module-level so that expanders and unions can validate an upstream table
+    with the *same* rule the class applies, rather than a second, drifting
+    copy of it.
+    """
+    return ARPTableFetcher._validate(frame)
+
+
+def _empty_table() -> pd.DataFrame:
+    """The canonical empty result: the required columns, no rows."""
+    return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+
+def _dedupe_key(row: pd.Series) -> tuple:
+    """Identity of one host row, for merging tables from several sources.
+
+    ``(ip, mac)`` and not ``ip`` alone: the same address appearing with two
+    different MAC addresses is a real conflict (a stale lease, a spoofed
+    neighbour, two interfaces on one host), and collapsing it would hide
+    exactly the thing worth seeing.  Two rows that agree on both are one host
+    seen twice, and merge.
+
+    A MAC is normalised first, so two spellings of one MAC (``AA-BB-..`` and
+    ``aa:bb:..``) are one identity rather than two rows.
+    """
+    ip = row.get("ip")
+    mac = row.get("mac_address")
+    if mac is None or (isinstance(mac, float) and pd.isna(mac)) or mac == "":
+        mac = None
+    else:
+        mac = normalise_mac(str(mac))
+    return (None if ip is None or pd.isna(ip) else str(ip), mac)
+
+
+def merge_tables(tables: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Merge ARP tables into one, deduplicated per host.
+
+    A row is identified by ``(ip, mac_address)``.  Sources disagree about how
+    much of a host they know, and the merge has to read that disagreement
+    correctly:
+
+    * same address, same MAC (or one of them unknown) — **one host**.  The
+      router's lease table (hostname + MAC + address) and the local neighbour
+      table (address + MAC) describe the same machine, and collapsing them is
+      what enriches the row instead of duplicating it;
+    * same address, a *different* MAC — **two rows**.  That is a real conflict
+      (a stale lease, a spoofed neighbour, two interfaces on one box), and
+      hiding it would hide exactly the thing worth seeing.  The conflicting row
+      is annotated ``conflict`` so a reader can tell it from a plain host;
+    * different address, same MAC — one machine with two addresses, and the
+      reason a MAC is part of the identity in the first place.
+
+    A column another source does not know is filled in from wherever it *is*
+    known, which is how one merged row ends up carrying a hostname, a MAC and
+    a provenance label that no single source had all of.
+    """
+    frames = [table for table in tables if table is not None and len(table)]
+    if not frames:
+        return _empty_table()
+
+    # Order the columns so the required ones lead and the rest stay stable.
+    columns: List[str] = []
+    for frame in frames:
+        for column in frame.columns:
+            if column not in columns:
+                columns.append(column)
+    for required in REQUIRED_COLUMNS:
+        if required in columns:
+            columns.remove(required)
+    columns = [*REQUIRED_COLUMNS, *columns]
+
+    records: List[Dict[str, Any]] = []
+    by_key: Dict[tuple, Dict[str, Any]] = {}
+    #: address → the row that knows the MAC for it, when exactly one does.
+    by_address: Dict[str, Dict[str, Any]] = {}
+
+    def absorb(record: Dict[str, Any], row: pd.Series) -> None:
+        for column, value in row.items():
+            if column in REQUIRED_COLUMNS:
+                continue
+            if _is_missing(record.get(column)):
+                if not _is_missing(value):
+                    record[column] = value
+            elif column == "via" and not _is_missing(value):
+                # How a host was reached accumulates: two SSH hops that both
+                # see a machine are two ways to reach it, and dropping either
+                # one loses the reason the walk happened.
+                record["via"] = _merge_via(record[column], value)
+
+    def note_conflict(record: Dict[str, Any]) -> None:
+        record["conflict"] = True
+
+    for frame in frames:
+        for _, row in frame.iterrows():
+            key = _dedupe_key(row)
+            address = key[0]
+            identified = key[1] is not None
+
+            known = by_key.get(key)
+            if known is not None:
+                absorb(known, row)
+                continue
+
+            partner = by_address.get(address) if address is not None else None
+            if partner is not None:
+                if not identified:
+                    # An uncovered spelling of a host that is already known:
+                    # complete the existing row instead of adding a second one.
+                    absorb(partner, row)
+                    by_key[key] = partner
+                    continue
+                if not partner.get("_identified"):
+                    # The address was first seen without a MAC (a resolver, a
+                    # hosts file).  This row names the MAC, so it *completes*
+                    # that host rather than conflicting with it.
+                    partner["mac_address"] = row.get("mac_address")
+                    partner["_identified"] = True
+                    absorb(partner, row)
+                    by_key[key] = partner
+                    continue
+                # The address is already pinned to a different MAC: a real
+                # conflict (a stale lease, a spoofed neighbour, two interfaces
+                # on one box), kept as its own row and flagged.
+                record = {column: row.get(column) for column in columns}
+                note_conflict(partner)
+                note_conflict(record)
+                records.append(record)
+                by_key[key] = record
+                by_address[address] = record
+                continue
+
+            record = {column: row.get(column) for column in columns}
+            record["_identified"] = identified
+            records.append(record)
+            by_key[key] = record
+            if address is not None:
+                by_address[address] = record
+
+    for record in records:
+        record.pop("_identified", None)
+
+    return pd.DataFrame(records, columns=columns) if records else _empty_table()
+
+
+def _merge_via(existing: Any, incoming: Any) -> str:
+    """Union two ``via`` labels into a comma-separated, order-stable list."""
+    seen: List[str] = []
+    for value in (existing, incoming):
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part not in seen:
+                seen.append(part)
+    return ",".join(seen)
+
+
+def _has_mac(row: pd.Series) -> bool:
+    """Whether a row identifies its host by MAC as well as by address."""
+    return not _is_missing(row.get("mac_address"))
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    return bool(isinstance(value, str) and not value.strip())
 
 
 def _strip_tags(cell: str) -> str:

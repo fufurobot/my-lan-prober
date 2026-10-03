@@ -687,26 +687,164 @@ classDiagram
 
 ---
 
-## 7. ARP Fetchers — Unchanged
+## 7. ARP Fetchers, FQDNs and Expanders
 
 ```mermaid
 classDiagram
-    class ARPTableFetcher { <<abstract>> +iptable() DataFrame +__lshift__ +__rshift__ }
+    class ARPTableFetcher { <<abstract>> +iptable() DataFrame +available() bool +__lshift__ +__rshift__ }
     class PlaywrightFetcher { <<abstract>> +run(context,password)* }
     class TPLoginFetcher
     class UnixArpFetcher
     class WindowsArpFetcher
     class OpenWRTFetcher
+    class HostsFileFetcher
+    class DnsTableFetcher
+    class ResolvedHostFetcher
     class FetcherChain
+    class ArpTableExpander { <<abstract>> +expand(frame) DataFrame* }
+    class TableUnion
+    class SSHArpTableExpander
+    class SSHHopExpander
+
     ARPTableFetcher <|-- PlaywrightFetcher
     PlaywrightFetcher <|-- TPLoginFetcher
     ARPTableFetcher <|-- UnixArpFetcher
     ARPTableFetcher <|-- WindowsArpFetcher
     ARPTableFetcher <|-- OpenWRTFetcher
+    ARPTableFetcher <|-- HostsFileFetcher
+    ARPTableFetcher <|-- DnsTableFetcher
+    ARPTableFetcher <|-- ResolvedHostFetcher
     ARPTableFetcher <|-- FetcherChain
+    ARPTableFetcher <|-- ArpTableExpander
+    ArpTableExpander <|-- TableUnion
+    ArpTableExpander <|-- SSHArpTableExpander
+    ArpTableExpander <|-- SSHHopExpander
 ```
 
-Fallback: `TPLoginFetcher >> UnixArpFetcher >> OpenWRTFetcher`.
+### 7a. `FQDN` — one type for everything reachable
+
+"FQDN" is used in its widest sense: **anything the computer can reach**. A
+reachable endpoint is an IPv4 address, an IPv6 address, a MAC address, a
+resolvable domain name, or a host behind a chain of SSH hops — and the prober
+meets all of them in the same tables.
+
+`FQDN` is a `str` subclass that classifies itself (`kind` ∈ `ipv4`, `ipv6`,
+`mac`, `hostname`, `unknown`), normalises what it can (MAC separators, IPv6
+spelling) and keeps equality working through the normalised value. Existing
+callers that pass plain strings keep working unchanged.
+
+| Member | Meaning |
+|---|---|
+| `kind` / `is_ipv4` … `is_hostname` | which shape of endpoint this is |
+| `value` | normalised spelling |
+| `hops`, `is_hop_chain`, `origin`, `destination` | `bastion>jump>target` |
+| `from_mac(mac, offset)` | derive a stable IPv4 endpoint for a MAC-only host |
+| `apply_offset(n)` | move an IPv4/IPv6 endpoint (raises for MAC/name) |
+
+`from_mac` is the primitive that makes expansion possible at all: a MAC has no
+address arithmetic, so a host known *only* by MAC is derived into the RFC 5737
+documentation range (`192.0.2.0/24`) by a pure function of the MAC and the
+offset. That determinism is what lets two fetchers — and two runs — agree on
+the identity of a host they each discovered a different way.
+
+### 7b. Fetchers vs. expanders
+
+A fetcher answers *"who did I already know about?"*.
+
+An **expander** answers *"who else can I now reach, given that table?"* — and
+it only ever adds rows, so the result is strictly a superset of what its
+upstreams produced.
+
+```python
+class ArpTableExpander(ARPTableFetcher):
+    def __init__(self, upstream):        # one fetcher, or a list of them
+        self.upstream = _as_fetcher_list(upstream)
+
+    @abstractmethod
+    def expand(self, frame: pd.DataFrame) -> pd.DataFrame: ...
+```
+
+The base class owns the parts that are easy to get wrong: calling upstreams
+safely (one broken source must not lose the others), merging their tables,
+deduplicating, and tagging provenance. Subclasses implement one method.
+
+| Expander | Expansion rule |
+|---|---|
+| `TableUnion` | merge every upstream, add nothing — the degenerate case |
+| `SSHArpTableExpander` | read each host's neighbour table over SSH, recursively |
+| `SSHHopExpander` | walk an explicit `bastion>jump>target` chain, one fetcher per hop |
+
+### 7c. `SSHArpTableExpander`
+
+A LAN is not flat. The machine running the prober sees its own neighbours; the
+router sees every DHCP lease; a server two hops away sees a whole subnet
+neither of them can reach. The expander closes that gap:
+
+1. seed from the configured hop (`--ssh-hop` / `SSH_HOP`) and the upstream
+   table's hosts;
+2. for each host, run the *same* neighbour-table commands the local fetchers
+   use (`cat /proc/net/arp`, `ip neigh show`, `arp -an`) and parse the output
+   with the *same* parsers;
+3. add what it found, and enqueue the newly discovered hosts;
+4. stop after `max_depth` tables have been collected.
+
+Two deliberate limits: the walk is **opt-in** (`--expand`, off by default),
+because logging into other people's machines is invasive; and it is
+**depth-bounded**, because a real LAN contains cycles and two hosts that both
+know each other would otherwise recurse forever.
+
+Hashed entries in `known_hosts` (`|1|base64|base64`) are skipped: they are
+hashed precisely so that reading them is not possible, and guessing which host
+they name is worse than not knowing.
+
+### 7d. Provenance
+
+A merged table from five sources is only useful if a reader can tell where each
+row came from, so provenance is part of the row:
+
+| Column | Meaning |
+|---|---|
+| `source` | which fetcher produced the row |
+| `via` | which SSH hop(s) saw it (comma-separated, accumulating) |
+| `depth` | how many expansion steps away it was |
+| `conflict` | this address was seen with a different MAC — a real conflict |
+
+### 7e. Merge rules
+
+`merge_tables()` identifies a host by `(ip, mac_address)`, and the three cases
+are not symmetric:
+
+* **same address, same MAC, or one of them absent** → one host, enriched. The
+  router's lease table (hostname + MAC + address) and the local neighbour table
+  (address + MAC) describe the same machine; collapsing them is what enriches
+  the row instead of duplicating it.
+* **same address, different MAC** → two rows, both flagged `conflict`. That is
+  a stale lease, a spoofed neighbour, or two interfaces on one box — hiding it
+  would hide exactly the thing worth seeing.
+* **different address, same MAC** → two rows, which is why a MAC is part of the
+  identity at all: one machine, two addresses.
+
+### 7f. The registry
+
+`FetcherRegistry` maps a name to a factory, so the engine can ask for a *set*
+of sources and merge them:
+
+```python
+registry = default_fetcher_registry()
+registry.names()                      # ['dns', 'hosts', 'openwrt', 'resolved', 'ssh', 'tplogin', 'unix', 'windows']
+registry.parse_selection("unix,dns")  # ['unix', 'dns']
+registry.parse_selection("all")       # every name
+registry.parse_selection("auto")      # the non-invasive set (no 'ssh')
+```
+
+The registry is also the seam that keeps optional dependencies optional: a
+source whose library is missing reports itself `available() == False` rather
+than failing the run.
+
+Fallback chains (`>>`) still exist and still work for callers who want
+"first non-empty wins"; the engine no longer uses one, because discarding the
+other sources' findings was the bug.
+
 
 ---
 
@@ -737,15 +875,21 @@ flowchart LR
 | `--port-strategy` | `PORT_STRATEGY` | `first` |
 | `--resolve-host` | `RESOLVE_HOSTS` | `tplogin.cn,localhost` |
 | `--output` | `OUTPUT_CSV` | `tplogin-arp-enriched.csv` |
-| `--fetcher` | `ARP_FETCHER` | `tplogin` |
+| `--fetcher` | `ARP_FETCHER` | `tplogin` (a comma-separated set, `all`, or `auto`) |
+| `--ssh-hop` | `SSH_HOP` | none |
+| `--expand` | `ARP_EXPAND` | off |
+| `--expand-depth` | `ARP_EXPAND_DEPTH` | `2` (tables collected) |
 | `--unsafe-tplogin-password` | `TPLOGIN_PASSWORD` | prompt |
 | `--browser` | `PW_BROWSER` | auto (first installed of chromium/firefox/webkit) |
 
 ```mermaid
 flowchart TD
     A[Config] --> B["Root HandlerChain via << / >>"]
-    A --> C["FetcherChain via >>"]
-    C --> D["iptable() → DataFrame[target, mode, …]"]
+    A --> C["FetcherRegistry.parse_selection(fetcher)"]
+    C --> C2["create() each named source"]
+    C2 --> C3["TableUnion → merged table (source/via/depth)"]
+    C3 --> C4["SSHArpTableExpander (only with --expand)"]
+    C4 --> D["merged DataFrame[ip, mac, mode, …]"]
     D --> E["ThreadPoolExecutor(max_workers)"]
     E --> F["worker(target)"]
     F --> G["chain.handle(target)"]
@@ -810,9 +954,16 @@ sequenceDiagram
 | **Persistor** | `Persistor` | ✔ | `history*`, `register*`, `store*`, `store_full`, `retrieve`, `persist*`, `resume*` |
 | | `PicklePersistor`, `JSONLPersistor`, `SQLitePersistor`, `ArrowPlasmaPersistor` | ✘ | disk-backed |
 | **Bridge** | `AsyncBridge` | ✘ | `run(coro)` |
-| **Fetcher** | `ARPTableFetcher` | ✔ | `iptable*`, `<<`, `>>` |
+| **Fetcher** | `ARPTableFetcher` | ✔ | `iptable*`, `available`, `<<`, `>>` |
 | | `PlaywrightFetcher` | ✔ | `run*`, `driver_env`, `browser_engine_name` (was `_detect_latest_browser`) |
 | | `TPLoginFetcher`, `UnixArpFetcher`, `WindowsArpFetcher`, `OpenWRTFetcher`, `FetcherChain` | mixed | per-source; the chain skips `available() == False` |
+| | `HostsFileFetcher`, `DnsTableFetcher`, `ResolvedHostFetcher` | ✘ | name → address, via `python-hosts` and `dnspython` (A **and** AAAA) |
+| **FQDN** | `FQDN` | ✘ | `str` subclass; `kind`, `hops`, `from_mac`, `apply_offset` |
+| **Expander** | `ArpTableExpander` | ✔ | `upstream`, `expand*`, provenance tagging, safe upstream calls |
+| | `TableUnion` | ✘ | merge everything, add nothing |
+| | `SSHArpTableExpander` | ✘ | known-hosts walk, `asyncssh`, depth-bounded |
+| | `SSHHopExpander` | ✘ | explicit `bastion>jump>target` chain |
+| **Registry** | `FetcherRegistry` | ✘ | `register`, `create`, `available`, `parse_selection` |
 | **Browsers** | `detect_browsers`, `first_available_browser` | ✘ | probes `executable_path` per engine |
 | **App** | `Config`, `Engine` | ✘ | — |
 

@@ -69,6 +69,21 @@ first-class abstractions for the things you keep re-implementing:
   and more.
 - 🏠 **DHCP lease scraping** with automatic source fallback: TP-Link
   (`tplogin.cn`) → local ARP table → OpenWRT over SSH.
+- 🧬 **One type for everything reachable.** An `FQDN` is an IPv4 address, an
+  IPv6 address, a MAC address, a domain name, or a chain of SSH hops — so a
+  table can hold a host learned by address *and* by MAC identity, and merging
+  them is defined instead of accidental.
+- 🪜 **ARP expanders.** A fetcher answers *"who did I already know about?"*; an
+  **expander** answers *"who else can I now reach?"*. `ArpTableExpander` is the
+  abstraction; `SSHArpTableExpander` reads each host's neighbour table over
+  SSH, recursively and depth-bounded, so a subnet two hops away stops being
+  invisible.
+- 🔗 **Every source contributes, merged before any port is probed.** The
+  router's leases, the local neighbour table, the hosts file, DNS and any SSH
+  hop are consulted *together* through a fetcher registry — not "first
+  non-empty table wins", which silently discarded whatever the others found.
+- 🏠 **DHCP lease scraping** with automatic source fallback: TP-Link
+  (`tplogin.cn`) → local ARP table → OpenWRT over SSH.
 - 🎭 **Playwright browser auto-detection** — `pip install playwright` does
   *not* install a browser, so the engine is chosen at run time by probing
   `executable_path` for chromium, firefox and webkit, and the first installed
@@ -258,11 +273,76 @@ print(frame[["host", "ip_address", "detected_services"]])
 | `--workers N` | `SCAN_WORKERS` | `os.cpu_count()` | Parallel worker threads |
 | `--resolve-host HOST` (repeatable) | `RESOLVE_HOSTS` (csv) | `tplogin.cn,localhost` | Hostnames to resolve & probe |
 | `--output PATH` | `OUTPUT_CSV` | `data/tplogin-arp-enriched.csv` | Unified output CSV |
-| `--fetcher {tplogin,unix,windows,openwrt,auto}` | `ARP_FETCHER` | `tplogin` | Preferred ARP source |
+| `--fetcher NAME[,NAME…]` | `ARP_FETCHER` | `tplogin` | Sources to merge: `tplogin`, `unix`, `windows`, `openwrt`, `hosts`, `dns`, `resolved`, `ssh`, or `all`/`auto` |
+| `--ssh-hop HOST` | `SSH_HOP` | — | SSH host to expand the table through |
+| `--expand` | `ARP_EXPAND` | off | Enable the SSH expansion walk (invasive, so opt-in) |
+| `--expand-depth N` | `ARP_EXPAND_DEPTH` | `2` | How many neighbour tables the walk collects |
 | `--unsafe-tplogin-password PW` | `TPLOGIN_PASSWORD` | prompt | ⚠️ Non-interactive login — leaks to `ps` |
 | `--browser NAME` | `PW_BROWSER` | `auto` | Playwright engine: `auto`/`chromium`/`firefox`/`webkit` |
 
 **Precedence:** CLI flag > environment variable > default.
+
+## ARP sources and expansion
+
+### Everything reachable is an `FQDN`
+
+```python
+from my_lan_prober import FQDN
+
+FQDN("192.168.1.104").kind        # 'ipv4'
+FQDN("fe80::1").kind              # 'ipv6'
+FQDN("AA-BB-CC-DD-EE-FF").value   # 'aa:bb:cc:dd:ee:ff'  (normalised)
+FQDN("tplogin.cn").kind           # 'hostname'
+FQDN("bastion>jump>target").hops  # ('bastion', 'jump', 'target')
+FQDN("2001:db8::1") == FQDN("2001:0db8:0000::1")   # True — one endpoint
+```
+
+`FQDN.from_mac(mac, offset)` derives a **stable** IPv4 endpoint for a host known
+only by MAC, inside the RFC 5737 documentation range. A MAC has no address
+arithmetic, and this is the primitive that lets two sources agree on the
+identity of a host they each found a different way.
+
+### Fetchers merge; expanders grow
+
+```text
+fetchers   →  who did I already know about?
+expanders  →  who else can I reach, given that table?
+```
+
+Before a single port is probed, every selected source contributes its table and
+they are merged on `(ip, mac_address)`:
+
+| Case | Result |
+|---|---|
+| same address, same MAC (or one unknown) | one host, enriched from both |
+| same address, **different** MAC | two rows, both flagged `conflict` |
+| different address, same MAC | two rows — one machine, two addresses |
+
+Rows carry `source`, `via` (which SSH hop saw it) and `depth`, so a merged table
+stays falsifiable.
+
+```bash
+# Merge the router, the local neighbour table and DNS
+uv run my-lan-prober --fetcher tplogin,unix,dns
+
+# Every implemented source
+uv run my-lan-prober --fetcher all
+
+# Expand through a host you can log into, and the hosts it can see
+uv run my-lan-prober --fetcher unix --expand --ssh-hop arch-server-main --expand-depth 2
+```
+
+As a library:
+
+```python
+from my_lan_prober import SSHArpTableExpander, TableUnion, UnixArpFetcher
+
+table = TableUnion([UnixArpFetcher()]).iptable()
+bigger = SSHArpTableExpander(UnixArpFetcher(), hop="arch-server-main", enabled=True).iptable()
+
+print(len(table), "->", len(bigger))
+```
+
 
 ## Browser detection
 
@@ -314,6 +394,9 @@ Every CLI flag has an env-var equivalent (see table above). Additional:
 | `TPLOGIN_PASSWORD` | Router admin password (safer than `--unsafe-tplogin-password`) |
 | `PROBESTACK_LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` (default `INFO`) |
 | `OPENWRT_HOST` | Host for the OpenWRT SSH fetcher |
+| `SSH_HOP` | SSH host to expand the ARP table through |
+| `ARP_EXPAND` | `1`/`true`/`yes`/`on` enables the SSH expansion walk |
+| `ARP_EXPAND_DEPTH` | How many neighbour tables the expansion walk collects |
 
 ## Extending my-lan-prober
 
@@ -386,6 +469,47 @@ Compose a fallback chain with `>>`:
 fetcher = TPLoginFetcher() >> UnixArpFetcher() >> OpenWRTFetcher()
 ```
 
+### Add an ARP source to the registry
+
+Registering makes a source selectable with `--fetcher` and, with `auto`/`all`,
+part of the merged table:
+
+```python
+from my_lan_prober import FetcherRegistry, default_fetcher_registry
+
+registry: FetcherRegistry = default_fetcher_registry()
+registry.register("fritzbox", lambda **kwargs: FritzBoxFetcher())
+
+registry.create("fritzbox")                 # the instance
+registry.parse_selection("unix,fritzbox")   # ['unix', 'fritzbox']
+```
+
+A source whose library is missing should report `available() == False` rather
+than raise — that is what keeps the optional extras optional.
+
+### Add an expander
+
+Subclass `ArpTableExpander` and implement one method. Everything else —
+calling upstreams safely, merging, deduplicating, tagging provenance — is
+inherited:
+
+```python
+import pandas as pd
+from my_lan_prober import ArpTableExpander
+
+
+class NeighbourExpander(ArpTableExpander):
+    """Also probe every host at its MAC-derived address."""
+
+    def expand(self, frame: pd.DataFrame) -> pd.DataFrame:
+        from my_lan_prober import FQDN
+
+        derived = frame.dropna(subset=["mac_address"]).copy()
+        derived["ip"] = [FQDN.from_mac(mac).value for mac in derived["mac_address"]]
+        derived["mode"] = "derived"
+        return derived
+```
+
 ## Output
 
 One unified CSV — `data/tplogin-arp-enriched.csv` by default:
@@ -396,7 +520,11 @@ One unified CSV — `data/tplogin-arp-enriched.csv` by default:
 | `mac_address` | Lease MAC address |
 | `ip_address` | Lease IPv4 address |
 | `valid_time` | Remaining lease time |
-| `mode` | `dhcp` / `arp` / `static` / `dynamic` |
+| `mode` | `dhcp` / `arp` / `dns` / `hosts` / `resolved` / `static` / `dynamic` |
+| `source` | Which ARP source produced the row |
+| `via` | Which SSH hop(s) saw it (comma-separated) |
+| `depth` | How many expansion steps away it was |
+| `conflict` | This address was also seen with a different MAC |
 | `icmp_ping` | ICMP reachability |
 | `detected_services` | Semicolon-joined `port:service` list |
 | `port_<N>_service` | Service identified on port `N` |
@@ -489,6 +617,17 @@ machine.
   `asyncio.windows_utils.pipe()`). Detection treats that as *no browser* so
   the scan degrades, rather than letting an infrastructural failure decide
   the outcome.
+- **A fetcher and an expander are mirror images.** A fetcher reports what was
+  already known; an expander derives what that implies and never removes a
+  row, so expansion is monotone and a failed hop degrades to the unexpanded
+  table instead of producing nothing.
+- **Provenance is a column, not a log line.** `source`, `via`, `depth` and
+  `conflict` travel with the row, because a table merged from five sources is
+  not falsifiable without them.
+- **Merging is not deduplication by address.** One address with two MACs is a
+  conflict worth seeing (a stale lease, a spoofed neighbour); one address seen
+  with and without a MAC is one host. Reading those two the same way was a real
+  bug caught by the test suite, in both directions.
 
 ## Development
 

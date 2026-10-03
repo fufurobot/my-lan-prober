@@ -245,6 +245,8 @@ build/
 
 # Local GitHub API probe helper (it reads GITHUB_TOKEN from .env)
 .gh_probe.py
+.gh_publish.py
+.gh_issue_numbers.json
 
 # Transient commit-message scratch files
 .commit-*.tmp

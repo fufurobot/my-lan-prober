@@ -12,6 +12,7 @@ Both sources must be pure enough to test offline: the parsing and the
 from __future__ import annotations
 
 import pandas as pd
+
 from my_lan_prober.dnsfetchers import (
     DnsTableFetcher,
     HostsFileFetcher,

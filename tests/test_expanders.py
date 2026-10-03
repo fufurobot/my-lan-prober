@@ -461,6 +461,9 @@ def test_ssh_expander_is_disabled_by_default_off_the_command_line():
 
 def test_ssh_expander_uses_asyncssh_by_default(monkeypatch):
     """The default probe is a real ``asyncssh`` run, not a stub."""
+    asyncssh = pytest.importorskip(
+        "asyncssh", reason="asyncssh is an optional extra (`uv sync --extra ssh`)"
+    )
     captured = {}
 
     class FakeConnection:
@@ -481,8 +484,6 @@ def test_ssh_expander_uses_asyncssh_by_default(monkeypatch):
 
         async def __aexit__(self, *exc):
             return False
-
-    import asyncssh
 
     monkeypatch.setattr(asyncssh, "connect", lambda *a, **k: FakeConnect(*a, **k))
 

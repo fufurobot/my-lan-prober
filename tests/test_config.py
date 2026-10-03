@@ -100,9 +100,8 @@ def test_resolve_hosts_env_is_csv(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_fetcher_choices_come_from_the_registry():
     """A new ARP source must become selectable without editing the CLI."""
-    from my_lan_prober.registry import default_fetcher_registry
-
     from my_lan_prober.config import FETCHER_CHOICES
+    from my_lan_prober.registry import default_fetcher_registry
 
     for name in default_fetcher_registry().names():
         assert name in FETCHER_CHOICES, name

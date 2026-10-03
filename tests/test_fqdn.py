@@ -14,12 +14,12 @@ from __future__ import annotations
 import pytest
 
 from my_lan_prober.fqdn import (
+    FQDN,
     KIND_HOSTNAME,
     KIND_IPV4,
     KIND_IPV6,
     KIND_MAC,
     KIND_UNKNOWN,
-    FQDN,
 )
 
 

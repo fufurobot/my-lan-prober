@@ -52,9 +52,9 @@ def test_the_designed_abstractions_are_exported():
 def test_the_arp_expansion_abstractions_are_exported():
     """The expander layer is public API, not an implementation detail."""
     from my_lan_prober import (
+        FQDN,
         ArpTableExpander,
         DnsTableFetcher,
-        FQDN,
         FetcherRegistry,
         HostsFileFetcher,
         ResolvedHostFetcher,

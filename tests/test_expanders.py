@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-
 from my_lan_prober.expanders import (
     ArpTableExpander,
     SSHArpTableExpander,
     SSHHopExpander,
     TableUnion,
 )
+
 from my_lan_prober.fetchers import ARPTableFetcher
 
 # ---------------------------------------------------------------------------

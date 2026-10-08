@@ -175,6 +175,13 @@ def _resolved(**kwargs: Any) -> ARPTableFetcher:
     return ResolvedHostFetcher()
 
 
+def _mdns(**kwargs: Any) -> ARPTableFetcher:
+    """Local discovery: addresses *and* the names that go with them."""
+    from .mdnsfetcher import MdnsFetcher
+
+    return MdnsFetcher()
+
+
 def _ssh(**kwargs: Any) -> ARPTableFetcher:
     """The SSH expander, as a source the engine can select.
 
@@ -208,6 +215,7 @@ def default_fetcher_registry() -> FetcherRegistry:
     registry.register("hosts", _hosts)
     registry.register("dns", _dns)
     registry.register("resolved", _resolved)
+    registry.register("mdns", _mdns)
     registry.register("ssh", _ssh)
     return registry
 

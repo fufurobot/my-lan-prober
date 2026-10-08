@@ -92,6 +92,7 @@ from .handlers import (
     SocketBannerHandler,
 )
 from .layers import LAYERS, LayerSpec, SessionRegistry
+from .mdnsfetcher import MdnsFetcher, parse_service_info
 from .persistors import (
     ArrowPlasmaPersistor,
     JSONLPersistor,
@@ -101,6 +102,8 @@ from .persistors import (
 )
 from .probes import COMMON_PORTS, ServiceIdentifier, icmp_ping, probe_service
 from .registry import FETCHER_REGISTRY, FetcherRegistry, default_fetcher_registry
+from .router import describe, missing_capabilities, router_capabilities
+from .scheduling import DependencyCycle, PriorityGraph
 from .sessions import (
     AsyncSession,
     AsyncSocketSession,
@@ -152,6 +155,16 @@ __all__ = [
     "ResolvedHostFetcher",
     "parse_hosts_entries",
     "resolve_names",
+    # local discovery
+    "MdnsFetcher",
+    "parse_service_info",
+    # scheduling
+    "PriorityGraph",
+    "DependencyCycle",
+    # router capabilities
+    "router_capabilities",
+    "missing_capabilities",
+    "describe",
     # registry
     "FetcherRegistry",
     "FETCHER_REGISTRY",

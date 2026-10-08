@@ -193,7 +193,7 @@ class Engine:
         if not fetchers:
             raise RuntimeError("no ARP source was selected")
 
-        union = TableUnion(fetchers)
+        union = TableUnion(fetchers, max_task=self.config.max_task)
         frame = union.iptable()
         log.info(
             "ARP table: %d host(s) from %s",

@@ -22,7 +22,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
@@ -452,12 +452,37 @@ def parse_bsd_arp(output: Any) -> pd.DataFrame:
 # Fetchers
 # ---------------------------------------------------------------------------
 class ARPTableFetcher(ABC):
-    """One source of LAN address mappings."""
+    """One source of LAN address mappings.
+
+    Beyond producing a table, a fetcher declares *when* it may run, which is
+    what lets a union of them be scheduled instead of serialised:
+
+    ``dependency()``
+        the sources that must have finished first.  Returns any iterable; the
+        order inside it is meaningless, because a prerequisite set has no
+        order.  Entries may be classes or (for convenience) their names.
+    ``priority``
+        an initial hint **and a writable attribute**.  A plain attribute rather
+        than a method because :class:`~my_lan_prober.expanders.TableUnion`
+        rewrites it: the union derives real levels from the dependency graph
+        and assigns them back, so the value after a run is the level actually
+        used.  The *sign* of the initial value is what carries meaning —
+        negative means "defer me past everything that is not".
+    """
+
+    #: Initial scheduling hint.  ``>= 0`` participates normally; ``< 0`` asks
+    #: to be deferred behind every non-negative source.  Overridden by
+    #: subclasses that want a different default; rewritten by ``TableUnion``.
+    priority: int = 0
 
     @abstractmethod
     def iptable(self) -> pd.DataFrame:
         """Return a DataFrame with at least ``ip`` and ``mode``."""
         raise NotImplementedError
+
+    def dependency(self) -> Iterable[Any]:
+        """Sources that must finish before this one runs."""
+        return ()
 
     def available(self) -> bool:
         """Whether this source can plausibly run here."""
@@ -867,6 +892,9 @@ class TPLoginFetcher(PlaywrightFetcher):
 class OpenWRTFetcher(ARPTableFetcher):
     """Read the neighbour table from an OpenWRT box over SSH."""
 
+    #: Logging into a router is slow and needs credentials, so it goes last.
+    priority = -1
+
     def __init__(
         self,
         host: Optional[str] = None,
@@ -900,7 +928,23 @@ class OpenWRTFetcher(ARPTableFetcher):
 
 
 class FetcherChain(ARPTableFetcher):
-    """Try each source in order; the first usable table wins."""
+    """Try each source in order and return the first usable table.
+
+    The capability the engine was built around, kept because it is still a
+    legitimate thing to *ask* for — one cheap source and no merging — but no
+    longer what a scan does by default.
+
+    It is deliberately **not** the engine's fetch path any more.  Two things a
+    scan wants are missing from it:
+
+    * it discards everything the other sources found, and
+    * it waits, serially, for one source to answer before trying the next.
+
+    :class:`~my_lan_prober.expanders.TableUnion` replaces both: every source
+    contributes, and sources run concurrently in dependency order.  Selecting
+    this class explicitly is how a caller opts back into the old serial
+    behaviour.
+    """
 
     def __init__(self, fetchers: Sequence[ARPTableFetcher]) -> None:
         self._fetchers: List[ARPTableFetcher] = []
@@ -963,11 +1007,16 @@ class FetcherChain(ARPTableFetcher):
 
 
 def default_fetcher_chain(browser: Optional[str] = None) -> FetcherChain:
-    """TP-Link first, then whichever local ARP table this OS provides.
+    """The legacy serial selection: TP-Link, then the local ARP table.
 
-    The local sources are the answer to "Playwright has no browser": they need
-    no credentials, no browser, and no extra dependency, so the scan degrades
-    to a plain ARP sweep instead of failing.
+    **Not what a scan does by default.**  The engine goes through
+    :class:`~my_lan_prober.registry.FetcherRegistry` and merges every selected
+    source with :class:`~my_lan_prober.expanders.TableUnion`; this helper is
+    kept for a caller who explicitly wants the old behaviour — try one source,
+    take the first table that answers, discard the rest.
+
+    It is no longer described as *the* fallback, because nothing falls back any
+    more: all the sources run and all their tables are merged.
     """
     return FetcherChain(
         [

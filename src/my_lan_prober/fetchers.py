@@ -928,7 +928,23 @@ class OpenWRTFetcher(ARPTableFetcher):
 
 
 class FetcherChain(ARPTableFetcher):
-    """Try each source in order; the first usable table wins."""
+    """Try each source in order and return the first usable table.
+
+    The capability the engine was built around, kept because it is still a
+    legitimate thing to *ask* for — one cheap source and no merging — but no
+    longer what a scan does by default.
+
+    It is deliberately **not** the engine's fetch path any more.  Two things a
+    scan wants are missing from it:
+
+    * it discards everything the other sources found, and
+    * it waits, serially, for one source to answer before trying the next.
+
+    :class:`~my_lan_prober.expanders.TableUnion` replaces both: every source
+    contributes, and sources run concurrently in dependency order.  Selecting
+    this class explicitly is how a caller opts back into the old serial
+    behaviour.
+    """
 
     def __init__(self, fetchers: Sequence[ARPTableFetcher]) -> None:
         self._fetchers: List[ARPTableFetcher] = []
@@ -991,11 +1007,16 @@ class FetcherChain(ARPTableFetcher):
 
 
 def default_fetcher_chain(browser: Optional[str] = None) -> FetcherChain:
-    """TP-Link first, then whichever local ARP table this OS provides.
+    """The legacy serial selection: TP-Link, then the local ARP table.
 
-    The local sources are the answer to "Playwright has no browser": they need
-    no credentials, no browser, and no extra dependency, so the scan degrades
-    to a plain ARP sweep instead of failing.
+    **Not what a scan does by default.**  The engine goes through
+    :class:`~my_lan_prober.registry.FetcherRegistry` and merges every selected
+    source with :class:`~my_lan_prober.expanders.TableUnion`; this helper is
+    kept for a caller who explicitly wants the old behaviour — try one source,
+    take the first table that answers, discard the rest.
+
+    It is no longer described as *the* fallback, because nothing falls back any
+    more: all the sources run and all their tables are merged.
     """
     return FetcherChain(
         [

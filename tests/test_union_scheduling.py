@@ -480,3 +480,35 @@ def test_the_union_needs_no_chain_wrapper():
         text = handle.read()
 
     assert "FetcherChain" not in text, "the union must not delegate to the chain"
+
+
+def test_the_engine_does_not_build_a_chain():
+    """A scan merges; it does not stop at the first source that answers."""
+    import my_lan_prober.engine as engine_module
+
+    source = engine_module.__file__ or ""
+    with open(source, encoding="utf-8") as handle:
+        text = handle.read()
+
+    assert "FetcherChain" not in text
+    assert "default_fetcher_chain" not in text
+
+
+def test_the_chain_stops_early_while_the_union_does_not():
+    """The behavioural difference the union was introduced to remove."""
+    from my_lan_prober.fetchers import FetcherChain
+
+    first = Recorder("first", frame=pd.DataFrame([{"ip": "10.0.0.1", "mode": "arp"}]))
+    second = Recorder("second", frame=pd.DataFrame([{"ip": "10.0.0.2", "mode": "arp"}]))
+
+    chained = FetcherChain([first, second]).iptable()
+
+    assert list(chained["ip"]) == ["10.0.0.1"]
+    assert second.calls == 0, "a chain stops at the first table"
+
+    third = Recorder("third", frame=pd.DataFrame([{"ip": "10.0.0.1", "mode": "arp"}]))
+    fourth = Recorder("fourth", frame=pd.DataFrame([{"ip": "10.0.0.2", "mode": "arp"}]))
+    merged = run(TableUnion([third, fourth]))
+
+    assert set(merged["ip"]) == {"10.0.0.1", "10.0.0.2"}
+    assert fourth.calls == 1, "a union consults every source"

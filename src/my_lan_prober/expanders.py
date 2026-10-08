@@ -35,6 +35,7 @@ sources without that is how a scan report becomes unfalsifiable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import abstractmethod
 from pathlib import Path
@@ -42,6 +43,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
+from .bridge import default_bridge
 from .fetchers import (
     REQUIRED_COLUMNS,
     ARPTableFetcher,
@@ -51,6 +53,7 @@ from .fetchers import (
     parse_proc_net_arp,
 )
 from .fqdn import FQDN
+from .scheduling import PriorityGraph
 
 log = logging.getLogger(__name__)
 
@@ -125,10 +128,23 @@ class ArpTableExpander(ARPTableFetcher):
     table and returns *additional* rows.  The base class owns everything else:
     calling the upstreams safely, merging their tables, tagging provenance, and
     combining the result with the extra rows.
+
+    An expander is **deferred** by default.  Without a table to expand it has
+    nothing to do, so it declares a dependency on its upstreams *and* a
+    negative priority: the dependency is what makes the result correct, the
+    negative priority is what keeps it out of the way while the fast, local
+    sources are still answering.
     """
+
+    #: Expansion is the slow, optional half of a scan; go after the sources.
+    priority = -1
 
     def __init__(self, upstream: Any = None) -> None:
         self.upstream: List[ARPTableFetcher] = _as_fetcher_list(upstream) if upstream else []
+
+    def dependency(self) -> List[Any]:
+        """The upstreams: expansion is meaningless before they have answered."""
+        return [type(fetcher) for fetcher in self.upstream]
 
     # -- the contract ---------------------------------------------------
     @abstractmethod
@@ -300,20 +316,121 @@ def _is_available(fetcher: ARPTableFetcher) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# TableUnion — merge everything, add nothing
+# TableUnion — merge everything, and schedule it properly
 # ---------------------------------------------------------------------------
 class TableUnion(ArpTableExpander):
-    """Every upstream table, merged into one.  The whole is the point.
+    """Every source's table, merged into one — scheduled rather than serialised.
 
     The engine used to stop at the first source that produced a non-empty
     table, which silently discarded hosts: the router's lease table knows DHCP
     clients, the local neighbour table knows the machines this host actually
-    talked to, and a resolver knows names neither of them has ever seen.  A
-    union keeps all of them, deduplicated per host.
+    talked to, and a resolver knows names neither of them has ever seen.
+
+    Two things changed once the sources stopped being a fallback *chain*:
+
+    * every source contributes, so nothing is thrown away; and
+    * the sources run **concurrently**, in dependency order, because waiting
+      for one of them to succeed while another could already be running is
+      wasted wall-clock time.  ``max_task`` bounds how many run at once.
+
+    The execution plan comes from :class:`~my_lan_prober.scheduling.PriorityGraph`:
+    levels from the declared dependency graph, deferred sources last, run from
+    the highest level down, each level concurrent.
     """
 
+    #: A union is a container, not a source: on its own it has nothing to add,
+    #: and whatever it wraps is what the caller actually wants run.
+    priority = -1
+
+    #: How many fetchers may be in flight at once, by default.
+    DEFAULT_MAX_TASK = 8
+
+    def __init__(self, upstream: Any = None, *, max_task: Optional[int] = None) -> None:
+        super().__init__(upstream)
+        limit = self.DEFAULT_MAX_TASK if max_task is None else int(max_task)
+        if limit < 1:
+            raise ValueError(f"max_task must be >= 1, got {max_task!r}")
+        #: Concurrency cap for one level.  Named ``max_task`` to match the CLI.
+        self.max_task = limit
+
+    # -- the plan -------------------------------------------------------
+    def assign_priorities(self) -> dict:
+        """Solve the dependency graph and write the levels onto the sources.
+
+        Does not fetch anything: the graph is a property of the declarations,
+        which is what makes it testable without a network.
+        """
+        graph = PriorityGraph(self.upstream)
+        return graph.assign()
+
+    def plan(self) -> list:
+        """The execution phases as lists of source names, first phase first."""
+        return PriorityGraph(self.upstream).plan()
+
+    # -- expansion ------------------------------------------------------
     def expand(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """A union adds nothing of its own; it *is* the merge of its sources."""
         return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+    # -- execution ------------------------------------------------------
+    def upstream_tables(self) -> List[tuple]:
+        """Fetch every source, phase by phase, concurrently inside a phase."""
+        graph = PriorityGraph(self.upstream)
+        graph.assign()
+        phases = graph.phases()
+
+        log.info(
+            "ARP sources scheduled in %d phase(s): %s",
+            len(phases),
+            " | ".join(" + ".join(type(f).__name__ for f in phase) for phase in phases),
+        )
+
+        collected: List[tuple] = []
+        for index, phase in enumerate(phases, start=1):
+            runnable = [fetcher for fetcher in phase if _is_available(fetcher)]
+            for fetcher in phase:
+                if fetcher not in runnable:
+                    log.debug("ARP source %s is not available here", type(fetcher).__name__)
+            if not runnable:
+                continue
+
+            log.debug("phase %d: %d source(s)", index, len(runnable))
+            collected.extend(self._run_phase(runnable))
+        return collected
+
+    def _run_phase(self, fetchers: Sequence[ARPTableFetcher]) -> List[tuple]:
+        """Run one phase's fetchers concurrently and collect their tables.
+
+        The bridge owns a loop in a background thread, so the synchronous
+        ``iptable()`` of each source is dispatched into a thread pool from
+        inside it.  A source that raises is logged and skipped: one broken
+        router must not cost the scan the other sources' findings.
+        """
+        if len(fetchers) == 1:
+            single = self._fetch_one(fetchers[0])
+            return [single] if single is not None else []
+
+        limiter = asyncio.Semaphore(self.max_task)
+
+        async def guarded(fetcher: ARPTableFetcher):
+            async with limiter:
+                return await asyncio.to_thread(self._fetch_one, fetcher)
+
+        async def gather():
+            return await asyncio.gather(*(guarded(fetcher) for fetcher in fetchers))
+
+        results = default_bridge().run(gather())
+        return [table for table in results if table is not None]
+
+    @staticmethod
+    def _fetch_one(fetcher: ARPTableFetcher) -> Optional[tuple]:
+        """Fetch one source, returning ``(fetcher, table)`` or ``None``."""
+        try:
+            table = _validate_frame(fetcher.iptable())
+        except Exception as exc:
+            log.warning("upstream %s failed: %s", type(fetcher).__name__, exc)
+            return None
+        return (fetcher, table)
 
     def iptable(self) -> pd.DataFrame:
         # Deliberately *not* going through ArpTableExpander.iptable: a union
@@ -337,14 +454,14 @@ class TableUnion(ArpTableExpander):
                 + ", ".join(type(fetcher).__name__ for fetcher in self.upstream)
             )
 
-        # Reuse the tables already fetched above, never call the upstreams
-        # again: fetching is where the side effects live (a Playwright scrape
-        # logs into the router, an SSH probe opens a connection).
+        # Reuse the tables already fetched, never call a source again: fetching
+        # is where the side effects live (a Playwright scrape logs into the
+        # router, an SSH probe opens a connection).
         tagged = [
             _tag(table, source=type(fetcher).__name__, depth=_depth_of(table))
             for fetcher, table in tables
         ]
-        merged = merge_tables(tagged)
+        merged = self.merge(tagged)
         log.info(
             "Merged ARP table: %d host(s) from %d source(s): %s",
             len(merged),
@@ -352,6 +469,10 @@ class TableUnion(ArpTableExpander):
             ", ".join(sorted({str(name) for name in merged.get("source", [])})),
         )
         return merged
+
+    def merge(self, tables: Sequence[pd.DataFrame]) -> pd.DataFrame:
+        """Combine the phase results.  Overridable, because merging is policy."""
+        return merge_tables(tables)
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
@@ -452,12 +452,37 @@ def parse_bsd_arp(output: Any) -> pd.DataFrame:
 # Fetchers
 # ---------------------------------------------------------------------------
 class ARPTableFetcher(ABC):
-    """One source of LAN address mappings."""
+    """One source of LAN address mappings.
+
+    Beyond producing a table, a fetcher declares *when* it may run, which is
+    what lets a union of them be scheduled instead of serialised:
+
+    ``dependency()``
+        the sources that must have finished first.  Returns any iterable; the
+        order inside it is meaningless, because a prerequisite set has no
+        order.  Entries may be classes or (for convenience) their names.
+    ``priority``
+        an initial hint **and a writable attribute**.  A plain attribute rather
+        than a method because :class:`~my_lan_prober.expanders.TableUnion`
+        rewrites it: the union derives real levels from the dependency graph
+        and assigns them back, so the value after a run is the level actually
+        used.  The *sign* of the initial value is what carries meaning —
+        negative means "defer me past everything that is not".
+    """
+
+    #: Initial scheduling hint.  ``>= 0`` participates normally; ``< 0`` asks
+    #: to be deferred behind every non-negative source.  Overridden by
+    #: subclasses that want a different default; rewritten by ``TableUnion``.
+    priority: int = 0
 
     @abstractmethod
     def iptable(self) -> pd.DataFrame:
         """Return a DataFrame with at least ``ip`` and ``mode``."""
         raise NotImplementedError
+
+    def dependency(self) -> Iterable[Any]:
+        """Sources that must finish before this one runs."""
+        return ()
 
     def available(self) -> bool:
         """Whether this source can plausibly run here."""
@@ -866,6 +891,9 @@ class TPLoginFetcher(PlaywrightFetcher):
 
 class OpenWRTFetcher(ARPTableFetcher):
     """Read the neighbour table from an OpenWRT box over SSH."""
+
+    #: Logging into a router is slow and needs credentials, so it goes last.
+    priority = -1
 
     def __init__(
         self,

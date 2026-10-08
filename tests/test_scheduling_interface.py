@@ -106,8 +106,8 @@ def test_dependency_returns_classes_or_names_and_both_are_accepted():
         def iptable(self):
             return EMPTY.copy()
 
-    assert list(WithClass().dependency())[0] is Other
-    assert list(WithName().dependency())[0] == "Other"
+    assert next(iter(WithClass().dependency())) is Other
+    assert next(iter(WithName().dependency())) == "Other"
 
 
 def test_priority_defaults_to_zero():

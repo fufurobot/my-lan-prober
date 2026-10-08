@@ -88,6 +88,24 @@ def _tmpdir_is_writable(path: Path) -> bool:
     return PlaywrightFetcher.temp_dir_is_usable(path)
 
 
+def _unusable_dir(tmp_path: Path, name: str = "unusable") -> Path:
+    """A path that ``mkdir`` and ``mkstemp`` both reject, on any platform.
+
+    Hardcoding an unwritable path does not work. ``/nonexistent-...`` and
+    ``/nope`` are perfectly creatable by the GitHub Linux runner (which can
+    write to ``/``), and on Windows ``Path("/nope") / "Temp"`` joins to a path
+    the runner can create too — so the "precondition: path must be unusable"
+    assertions passed while the code under test happily used those paths.
+
+    A **file** where a directory is expected is unusable everywhere: ``mkdir``
+    fails with ``ENOTDIR``, and so does any create inside it. That is a
+    property of the filesystem, not of the uid the tests happen to run as.
+    """
+    blocker = tmp_path / f"{name}-blocker"
+    blocker.write_text("a file, not a directory", encoding="utf-8")
+    return blocker / "sub"
+
+
 # ---------------------------------------------------------------------------
 # The invariant the project must uphold
 # ---------------------------------------------------------------------------
@@ -170,14 +188,16 @@ def test_driver_env_sets_all_three_variables_consistently():
     assert env["TMPDIR"] == env["TMP"] == env["TEMP"]
 
 
-def test_driver_env_overrides_an_unusable_inherited_value(monkeypatch):
+def test_driver_env_overrides_an_unusable_inherited_value(monkeypatch, tmp_path):
     """The MSYS2 case: an inherited temp dir that cannot be written must lose.
 
-    The unusable path is constructed rather than hardcoded: ``/tmp`` is a
+    The unusable path is *constructed* rather than hardcoded.  ``/tmp`` is a
     perfectly good temp directory on Linux (where CI runs part of the matrix),
-    so asserting ``!= "/tmp"`` would be asserting a Windows-only accident.
+    so asserting ``!= "/tmp"`` would be asserting a Windows-only accident —
+    and an invented path like ``/nope`` is not reliably unwritable either, as
+    the runner can write to ``/``.
     """
-    unusable = Path("/nonexistent-temp-for-my-lan-prober")
+    unusable = _unusable_dir(tmp_path)
     assert not _tmpdir_is_writable(unusable), "precondition: path must be unusable"
     monkeypatch.setenv("TMPDIR", str(unusable))
     monkeypatch.setenv("TMP", str(unusable))
@@ -218,11 +238,12 @@ def test_driver_env_finds_a_fallback_when_every_candidate_is_bad(monkeypatch, tm
     else fails, and accepting that would litter the workspace with browser
     artifacts.
     """
-    monkeypatch.setenv("TMPDIR", "/nope")
-    monkeypatch.setenv("TMP", "/nope")
-    monkeypatch.setenv("TEMP", "/nope")
-    monkeypatch.setenv("LOCALAPPDATA", "/nope")
-    monkeypatch.setenv("SYSTEMROOT", "/nope")
+    unusable = str(_unusable_dir(tmp_path, "every-candidate"))
+    monkeypatch.setenv("TMPDIR", unusable)
+    monkeypatch.setenv("TMP", unusable)
+    monkeypatch.setenv("TEMP", unusable)
+    monkeypatch.setenv("LOCALAPPDATA", unusable)
+    monkeypatch.setenv("SYSTEMROOT", unusable)
     fallback = tmp_path / "playwright-temp"
     monkeypatch.setattr(PlaywrightFetcher, "FALLBACK_TEMP_DIR", fallback)
 
@@ -267,9 +288,10 @@ def test_ensure_temp_env_points_every_variable_at_a_writable_directory(monkeypat
     """
     from my_lan_prober.config import TEMP_ENV_VARS, ensure_temp_env
 
-    monkeypatch.setenv("TMPDIR", "/nope")
-    monkeypatch.setenv("TMP", "/nope")
-    monkeypatch.setenv("TEMP", "/nope")
+    unusable = str(_unusable_dir(tmp_path, "repair"))
+    monkeypatch.setenv("TMPDIR", unusable)
+    monkeypatch.setenv("TMP", unusable)
+    monkeypatch.setenv("TEMP", unusable)
 
     chosen = ensure_temp_env(tmp_path)
 
@@ -316,9 +338,10 @@ def test_ensure_temp_env_creates_the_workaround_directory(monkeypatch, tmp_path)
     """``playwright-temp`` is created on demand, under the given base."""
     from my_lan_prober.config import ensure_temp_env
 
-    monkeypatch.setenv("TMPDIR", "/nope")
-    monkeypatch.setenv("TMP", "/nope")
-    monkeypatch.setenv("TEMP", "/nope")
+    unusable = str(_unusable_dir(tmp_path, "workaround"))
+    monkeypatch.setenv("TMPDIR", unusable)
+    monkeypatch.setenv("TMP", unusable)
+    monkeypatch.setenv("TEMP", unusable)
 
     chosen = ensure_temp_env(tmp_path / "base")
 

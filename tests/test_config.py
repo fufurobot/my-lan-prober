@@ -95,6 +95,93 @@ def test_resolve_hosts_env_is_csv(monkeypatch):
     assert Config.resolve([]).resolve_hosts == ["x.local", "y.local"]
 
 
+# ---------------------------------------------------------------------------
+# --fetcher now names a *set* of registry sources, not a single one
+# ---------------------------------------------------------------------------
+def test_fetcher_choices_come_from_the_registry():
+    """A new ARP source must become selectable without editing the CLI."""
+    from my_lan_prober.config import FETCHER_CHOICES
+    from my_lan_prober.registry import default_fetcher_registry
+
+    for name in default_fetcher_registry().names():
+        assert name in FETCHER_CHOICES, name
+
+
+def test_fetcher_choice_list_still_offers_the_modes():
+    from my_lan_prober.config import FETCHER_CHOICES
+
+    assert "auto" in FETCHER_CHOICES
+    assert "all" in FETCHER_CHOICES
+
+
+def test_fetcher_accepts_a_comma_separated_selection(monkeypatch):
+    monkeypatch.delenv("ARP_FETCHER", raising=False)
+
+    assert Config.resolve(["--fetcher", "unix,dns"]).fetcher == "unix,dns"
+
+
+def test_fetcher_rejects_an_unknown_name(monkeypatch):
+    monkeypatch.delenv("ARP_FETCHER", raising=False)
+
+    with pytest.raises(SystemExit):
+        Config.resolve(["--fetcher", "unix,nope"])
+
+
+def test_fetcher_all_is_accepted(monkeypatch):
+    monkeypatch.delenv("ARP_FETCHER", raising=False)
+
+    assert Config.resolve(["--fetcher", "all"]).fetcher == "all"
+
+
+def test_ssh_hop_is_configurable_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SSH_HOP", "arch-server-main")
+
+    assert Config.resolve([]).ssh_hop == "arch-server-main"
+
+
+def test_ssh_hop_flag_overrides_the_environment(monkeypatch):
+    monkeypatch.setenv("SSH_HOP", "from-env")
+
+    assert Config.resolve(["--ssh-hop", "from-flag"]).ssh_hop == "from-flag"
+
+
+def test_ssh_hop_defaults_to_none(monkeypatch):
+    monkeypatch.delenv("SSH_HOP", raising=False)
+
+    assert Config.resolve([]).ssh_hop is None
+
+
+def test_expand_flag_defaults_to_false(monkeypatch):
+    """Walking the LAN over SSH must be opt-in."""
+    monkeypatch.delenv("ARP_EXPAND", raising=False)
+
+    assert Config.resolve([]).expand is False
+
+
+def test_expand_can_be_switched_on(monkeypatch):
+    monkeypatch.delenv("ARP_EXPAND", raising=False)
+
+    assert Config.resolve(["--expand"]).expand is True
+
+
+def test_expand_reads_the_environment(monkeypatch):
+    monkeypatch.setenv("ARP_EXPAND", "1")
+
+    assert Config.resolve([]).expand is True
+
+
+def test_expand_depth_is_configurable(monkeypatch):
+    monkeypatch.delenv("ARP_EXPAND_DEPTH", raising=False)
+
+    assert Config.resolve(["--expand", "--expand-depth", "3"]).expand_depth == 3
+
+
+def test_expand_depth_has_a_bounded_default(monkeypatch):
+    monkeypatch.delenv("ARP_EXPAND_DEPTH", raising=False)
+
+    assert Config.resolve([]).expand_depth >= 1
+
+
 def test_fetcher_choice_is_validated(monkeypatch):
     monkeypatch.delenv("ARP_FETCHER", raising=False)
 

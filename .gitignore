@@ -250,3 +250,8 @@ build/
 
 # Transient commit-message scratch files
 .commit-*.tmp
+
+# Second-wave GitHub publish helper (reads GITHUB_TOKEN from .env)
+.gh_publish2.py
+.gh_issue_smoke.py
+.ci_compare.py

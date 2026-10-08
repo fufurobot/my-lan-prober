@@ -49,6 +49,12 @@ DEFAULT_OUTPUT = "data/tplogin-arp-enriched.csv"
 #: collects.  One is "just the hop I named"; more follows what that hop saw.
 DEFAULT_EXPAND_DEPTH = 2
 
+#: Default cap on how many ARP sources run at once inside one priority level.
+#: Chosen to be comfortably above the number of *local* sources (which are
+#: cheap and should all go at once) while still bounding a selection that
+#: fans out over SSH.
+DEFAULT_MAX_TASK = 8
+
 #: Variables every child process consults, in Playwright's own priority order.
 TEMP_ENV_VARS: Sequence[str] = ("TMPDIR", "TMP", "TEMP")
 
@@ -197,6 +203,17 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-task",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "How many ARP sources may run at once within one priority level. "
+            "Sources on the same level already run concurrently; this bounds "
+            f"them. Default: {DEFAULT_MAX_TASK}. Env: ARP_MAX_TASK."
+        ),
+    )
+    parser.add_argument(
         "--ssh-hop",
         default=None,
         metavar="HOST",
@@ -325,6 +342,8 @@ class Config:
     expand: bool = False
     #: How many neighbour tables the expansion walk collects.
     expand_depth: int = DEFAULT_EXPAND_DEPTH
+    #: How many ARP sources may run at once within one priority level.
+    max_task: int = DEFAULT_MAX_TASK
 
     #: Kept out of ``repr`` so a logged config never leaks the password.
     _SECRET_FIELDS = ("password",)
@@ -388,6 +407,10 @@ class Config:
         if expand_depth < 1:
             expand_depth = 1
 
+        max_task = args.max_task or _env_int("ARP_MAX_TASK") or DEFAULT_MAX_TASK
+        if max_task < 1:
+            raise ValueError(f"--max-task must be >= 1 (got {max_task!r})")
+
         return cls(
             port_timeout=port_timeout,
             workers=workers,
@@ -400,4 +423,5 @@ class Config:
             ssh_hop=ssh_hop,
             expand=expand,
             expand_depth=expand_depth,
+            max_task=max_task,
         )

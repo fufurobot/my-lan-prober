@@ -18,6 +18,14 @@ dependencies = [
 my-lan-prober = "my_lan_prober:main"
 
 [project.optional-dependencies]
+# One extra for the whole "talk to a router" story: a web UI, an SSH hop, and
+# mDNS discovery.  The individual extras stay so a caller who needs only one
+# of them does not pull in the other two.
+router = [
+    "playwright>=1.63.0",
+    "asyncssh>=2.24.0",
+    "zeroconf>=0.151.5",
+]
 ssh = [
     "asyncssh>=2.24.0",
 ]

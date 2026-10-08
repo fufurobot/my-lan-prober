@@ -144,7 +144,7 @@ def _iter_dependencies(fetcher: Any) -> Iterable[Any]:
         return ()
     if declared is None:
         return ()
-    if isinstance(declared, type) or isinstance(declared, str):
+    if isinstance(declared, (type, str)):
         return (declared,)
     try:
         return tuple(declared)

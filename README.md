@@ -67,8 +67,8 @@ first-class abstractions for the things you keep re-implementing:
   TLS, SSH, HTTP/1.1, HTTP/2, HTTP/3, QUIC, WebSocket, gRPC, MQTT, AMQP,
   Kafka, DNS, mDNS, NFS, SMB, RDP, VNC, LDAP, SMTP/IMAP/POP3, SIP, RTP, CoAP,
   and more.
-- 🏠 **DHCP lease scraping** with automatic source fallback: TP-Link
-  (`tplogin.cn`) → local ARP table → OpenWRT over SSH.
+- 🏠 **DHCP lease scraping** from the TP-Link web UI (`tplogin.cn`),
+  replicating the tested login flow.
 - 🧬 **One type for everything reachable.** An `FQDN` is an IPv4 address, an
   IPv6 address, a MAC address, a domain name, or a chain of SSH hops — so a
   table can hold a host learned by address *and* by MAC identity, and merging
@@ -79,29 +79,36 @@ first-class abstractions for the things you keep re-implementing:
   SSH, recursively and depth-bounded, so a subnet two hops away stops being
   invisible.
 - 🔗 **Every source contributes, merged before any port is probed.** The
-  router's leases, the local neighbour table, the hosts file, DNS and any SSH
-  hop are consulted *together* through a fetcher registry — not "first
+  router's leases, the local neighbour table, the hosts file, DNS, mDNS and any
+  SSH hop are consulted *together* through a fetcher registry — not "first
   non-empty table wins", which silently discarded whatever the others found.
-- 🏠 **DHCP lease scraping** with automatic source fallback: TP-Link
-  (`tplogin.cn`) → local ARP table → OpenWRT over SSH.
+- ⚡ **Sources run concurrently, in dependency order.** Each source declares
+  what it must wait for (`dependency()`) and how urgent it is (`priority`); the
+  union solves that graph into levels and runs each level in parallel, bounded
+  by `--max-task`. Deferred sources — SSH hops, mDNS discovery — go last, so a
+  slow or broken one never holds up a local read.
+- 🔎 **mDNS discovery** finds hosts *and* the names they answer to, in one
+  pass — the only LAN protocol that volunteers both. It is deferred and
+  optional (`zeroconf`).
+- 📦 **One extra for the whole router story** — `my-lan-prober[router]` pulls in
+  Playwright (scrape the UI), asyncssh (walk the LAN) and zeroconf (discover
+  locally), so you do not have to assemble three extras to reach your router.
 - 🎭 **Playwright browser auto-detection** — `pip install playwright` does
   *not* install a browser, so the engine is chosen at run time by probing
   `executable_path` for chromium, firefox and webkit, and the first installed
   one is used. `--browser`/`PW_BROWSER` overrides it.
-- 🖥️ **OS-independent local ARP fallback** — tries `/proc/net/arp`, then
+- 🖥️ **OS-independent local ARP reading** — tries `/proc/net/arp`, then
   `ip neigh`, then `arp -an`/`arp -a`, so it works on Linux, macOS, BSD, and
-  Windows with no extra dependency. This is what you get when `tplogin.cn`
-  does *not* point at a TP-Link router, **and** when no Playwright browser is
-  installed at all: the router's web UI is unreachable without a browser, so
-  the scan degrades to the neighbour table instead of failing.
-- 🎭 **Playwright fetcher** for routers with a web UI, replicating the tested
-  login flow.
+  Windows with no extra dependency. It reads the neighbour table whatever else
+  is or is not available: with no Playwright browser the router's web UI is
+  simply one source that reports itself unavailable, and the scan proceeds with
+  the others rather than degrading to a single fallback.
 - 💾 **Pluggable persistence** — Pickle, JSONL, SQLite, Arrow/Parquet; or
   in-memory if you skip it entirely.
 - 🧵 **One asyncio loop per process**, safely bridged to a sync API — no
   greenlets, no "sync API inside asyncio" errors.
-- 🧪 **Everything testable** — 335 tests; handlers, sessions, fetchers, and
-  browser detection are independent and can be driven by hand.
+- 🧪 **Everything testable** — 569 tests; handlers, sessions, fetchers, the
+  scheduler and browser detection are independent and can be driven by hand.
 
 ## Architecture
 
@@ -226,18 +233,30 @@ cd my-lan-prober
 # Create venv and install with dev extras
 uv sync --extra dev
 
-# Optional runtime extras
-uv sync --extra playwright --extra ssh --extra dotenv
+# Everything needed to reach a router: scrape its UI, walk the LAN over SSH,
+# and discover hosts over mDNS
+uv sync --extra router
+
+# Or just the pieces you need
+uv sync --extra playwright --extra ssh --extra mdns
 ```
 
 Or, as a dependency:
 
 ```bash
-uv add my-lan-prober[playwright,ssh,dotenv]
+uv add "my-lan-prober[router]"          # playwright + asyncssh + zeroconf
+uv add "my-lan-prober[playwright,ssh]"  # or pick individually
 ```
 
-Only `pandas` and `tqdm` are mandatory. Everything else is optional and
-imported lazily.
+`pandas`, `tqdm`, `python-hosts` and `dnspython` are mandatory. Everything else
+is optional and imported lazily, so a missing extra costs you one source, not
+the run:
+
+```python
+from my_lan_prober import router_capabilities
+
+router_capabilities()   # {'playwright': False, 'asyncssh': True, 'zeroconf': False}
+```
 
 ## Quick start
 
@@ -273,7 +292,8 @@ print(frame[["host", "ip_address", "detected_services"]])
 | `--workers N` | `SCAN_WORKERS` | `os.cpu_count()` | Parallel worker threads |
 | `--resolve-host HOST` (repeatable) | `RESOLVE_HOSTS` (csv) | `tplogin.cn,localhost` | Hostnames to resolve & probe |
 | `--output PATH` | `OUTPUT_CSV` | `data/tplogin-arp-enriched.csv` | Unified output CSV |
-| `--fetcher NAME[,NAME…]` | `ARP_FETCHER` | `tplogin` | Sources to merge: `tplogin`, `unix`, `windows`, `openwrt`, `hosts`, `dns`, `resolved`, `ssh`, or `all`/`auto` |
+| `--fetcher NAME[,NAME…]` | `ARP_FETCHER` | `tplogin` | Sources to merge: `tplogin`, `unix`, `windows`, `openwrt`, `hosts`, `dns`, `resolved`, `mdns`, `ssh`, or `all`/`auto` |
+| `--max-task N` | `ARP_MAX_TASK` | `8` | How many sources may run at once within one priority level |
 | `--ssh-hop HOST` | `SSH_HOP` | — | SSH host to expand the table through |
 | `--expand` | `ARP_EXPAND` | off | Enable the SSH expansion walk (invasive, so opt-in) |
 | `--expand-depth N` | `ARP_EXPAND_DEPTH` | `2` | How many neighbour tables the walk collects |
@@ -397,6 +417,7 @@ Every CLI flag has an env-var equivalent (see table above). Additional:
 | `SSH_HOP` | SSH host to expand the ARP table through |
 | `ARP_EXPAND` | `1`/`true`/`yes`/`on` enables the SSH expansion walk |
 | `ARP_EXPAND_DEPTH` | How many neighbour tables the expansion walk collects |
+| `ARP_MAX_TASK` | How many ARP sources may run at once within one priority level |
 
 ## Extending my-lan-prober
 
@@ -463,7 +484,32 @@ class FritzBoxFetcher(ARPTableFetcher):
         ...
 ```
 
-Compose a fallback chain with `>>`:
+An ARP source declares *when* it may run as well as what it produces, and the
+union uses that to schedule a scan:
+
+```python
+from my_lan_prober import ARPTableFetcher
+
+
+class SlowDiscoveryFetcher(ARPTableFetcher):
+    #: Deferred: this runs after every non-negative source has finished.
+    priority = -1
+
+    def dependency(self):
+        # Any iterable; order is ignored. Naming a source that the run did not
+        # select is fine — it is simply not waited for.
+        return {UnixArpFetcher}
+
+    def iptable(self):
+        # Return a DataFrame with at least ["ip", "mac_address", "mode"]
+        ...
+```
+
+`priority` is a plain writable attribute, because the union **rewrites** it:
+after a run it holds the level that was actually used.
+
+Compose a strict "first non-empty table wins" chain with `>>` — this is the
+legacy serial behaviour, not what a scan does:
 
 ```python
 fetcher = TPLoginFetcher() >> UnixArpFetcher() >> OpenWRTFetcher()
@@ -602,16 +648,22 @@ machine.
 - **`Framing` strategies** carry the shape of every protocol: stream,
   datagram, length-prefix, varint, delimiter, fixed-size, request-response,
   multiplex. 79 protocols collapse to 8 framing strategies plus a data table.
-- **Local ARP is the fallback, not the default.** If `tplogin.cn` doesn't
-  resolve to a TP-Link router, the chain falls through to the OS ARP table,
-  which needs no credentials and no extra dependency. The same fallback
-  catches the case where no Playwright browser is installed at all: the
-  router is unreachable without one, but the neighbour table is not.
-- **Unavailable sources are skipped, not called.** `FetcherChain` asks
-  `available()` before invoking a source, so "no browser installed" costs a
-  `False` rather than a raised `Error` that has to be caught and
-  interpreted. That distinction is what makes the degradation intentional
-  rather than accidental.
+- **There is no fallback chain any more.** The sources are not alternatives:
+  the router's leases, the local neighbour table, the hosts file, DNS and mDNS
+  each know something about the network that the others do not, so every
+  selected source runs and every table is merged. The old chain both discarded
+  the other sources' findings and waited for one to answer before trying the
+  next. `FetcherChain` remains for callers who explicitly want that serial
+  behaviour.
+- **Unavailable sources are skipped, not called.** `available()` is consulted
+  before a source is invoked, so "no browser installed" costs a `False` rather
+  than a raised error that has to be caught and interpreted. It is also why a
+  missing extra never fails a scan: the source simply reports itself
+  unavailable and the rest carry on.
+- **Scheduling is derived, not configured.** Nobody writes "run DNS before
+  mDNS" by hand: a source declares its prerequisites, the union solves the
+  graph, and cycles are reported rather than broken arbitrarily — which edge to
+  cut is a decision only the caller can make.
 - **"Cannot tell" means "not installed".** Playwright's driver is a child
   process and can die on startup (on Windows, inside
   `asyncio.windows_utils.pipe()`). Detection treats that as *no browser* so

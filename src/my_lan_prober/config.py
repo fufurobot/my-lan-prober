@@ -34,6 +34,7 @@ FETCHER_CHOICES = (
     "hosts",
     "dns",
     "resolved",
+    "mdns",
     "ssh",
     "all",
     "auto",

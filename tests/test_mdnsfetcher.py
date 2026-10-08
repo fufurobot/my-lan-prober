@@ -17,9 +17,10 @@ Two properties matter for scheduling:
 
 from __future__ import annotations
 
-from my_lan_prober.mdnsfetcher import MdnsFetcher, parse_service_info
+import pytest
 
 from my_lan_prober.fetchers import ARPTableFetcher
+from my_lan_prober.mdnsfetcher import MdnsFetcher, parse_service_info
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +193,33 @@ def test_mdns_fetcher_has_a_bounded_timeout():
 # ---------------------------------------------------------------------------
 # The router extra ties the three together
 # ---------------------------------------------------------------------------
-def test_router_extra_declares_all_three_dependencies():
-    """``router`` is the one extra that covers the whole story."""
+def _optional_dependencies() -> dict:
+    """The ``[project.optional-dependencies]`` table, on any supported Python.
+
+    ``tomllib`` is 3.11+; this project supports 3.10, where ``tomli`` is the
+    same parser under its pre-standardisation name. A real TOML parse is worth
+    insisting on: hand-reading the file gets the ``>=`` in every version
+    specifier wrong.
+    """
+    try:
+        import tomllib as toml_reader
+    except ImportError:
+        try:
+            import tomli as toml_reader  # type: ignore[no-redef]
+        except ImportError:  # pragma: no cover - CI's 3.10 leg may lack it
+            pytest.skip("no TOML parser available (tomllib on 3.11+, tomli below)")
+
     from pathlib import Path
 
-    import tomllib
-
     project = Path(__file__).resolve().parent.parent / "pyproject.toml"
-    data = tomllib.loads(project.read_text(encoding="utf-8"))
-    extra = data["project"]["optional-dependencies"]["router"]
-    joined = " ".join(extra)
+    return toml_reader.loads(project.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+
+
+def test_router_extra_declares_all_three_dependencies():
+    """``router`` is the one extra that covers the whole story."""
+    joined = " ".join(_optional_dependencies()["router"])
 
     assert "playwright" in joined
     assert "asyncssh" in joined
@@ -210,13 +228,7 @@ def test_router_extra_declares_all_three_dependencies():
 
 def test_the_individual_extras_survive():
     """A caller who needs one of the three must not have to take all three."""
-    from pathlib import Path
-
-    import tomllib
-
-    project = Path(__file__).resolve().parent.parent / "pyproject.toml"
-    data = tomllib.loads(project.read_text(encoding="utf-8"))
-    extras = data["project"]["optional-dependencies"]
+    extras = _optional_dependencies()
 
     assert "playwright" in extras
     assert "asyncssh" in " ".join(extras["ssh"])

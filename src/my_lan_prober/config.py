@@ -8,6 +8,7 @@ never leak it.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,9 @@ __all__ = [
     "parse_cli_args",
     "resolve_port_timeout",
     "ensure_temp_env",
+    "configure_logging",
+    "LOG_LEVELS",
+    "VERBOSE_DEFAULT_LEVEL",
     "FETCHER_CHOICES",
     "BROWSER_NAMES",
     "BROWSER_CHOICES",
@@ -204,6 +208,19 @@ def parse_cli_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verbose",
+        "-v",
+        action=_VerboseAction,
+        nargs="?",
+        default=None,
+        metavar="LEVEL",
+        help=(
+            "Log more. Bare --verbose means DEBUG; an explicit level may "
+            f"follow ({', '.join(LOG_LEVELS)}). Overrides "
+            "PROBESTACK_LOG_LEVEL."
+        ),
+    )
+    parser.add_argument(
         "--max-task",
         type=int,
         default=None,
@@ -324,6 +341,99 @@ def _env_flag(name: str) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+#: Logging levels ``--verbose`` accepts, in ``logging``'s own order.
+LOG_LEVELS: Sequence[str] = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+#: What a bare ``--verbose`` means.
+VERBOSE_DEFAULT_LEVEL = "DEBUG"
+
+
+class _VerboseAction(argparse.Action):
+    """``--verbose`` with an *optional* value.
+
+    ``nargs="?"`` is the obvious spelling and it is wrong here: it consumes any
+    following token that does not look like an option, so ``--verbose
+    --output`` is fine but a bare ``--verbose`` followed by a positional would
+    silently swallow it — and ``--verbose WARNING`` and ``--verbose localhost``
+    become indistinguishable, so a typo'd level is accepted as a value and the
+    run continues at a level nobody asked for.
+
+    This action consumes the next token only when it *is* a known level name,
+    which makes the two cases unambiguous:
+
+    * the token is a level → use it;
+    * anything else → bare ``--verbose``, meaning DEBUG, and the token is left
+      for the rest of the parser.
+
+    The one thing it cannot do is accept a level name that is also a legitimate
+    positional. No such collision exists here (the values are hostnames and
+    paths), and the alternative — requiring ``--verbose=LEVEL`` — is worse
+    ergonomics for the common case.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        level = VERBOSE_DEFAULT_LEVEL
+        if values is not None:
+            candidate = str(values).strip().upper()
+            if candidate not in LOG_LEVELS:
+                parser.error(
+                    f"argument {option_string}: invalid level {values!r} "
+                    f"(choose from {', '.join(LOG_LEVELS)})"
+                )
+            level = candidate
+        # Repeating the flag must not *lower* the level: `--verbose -v` is a
+        # person double-tapping, not a request for less output.
+        previous = getattr(namespace, self.dest, None)
+        if previous is not None and LOG_LEVELS.index(previous) < LOG_LEVELS.index(level):
+            level = previous
+        setattr(namespace, self.dest, level)
+
+
+def _resolve_log_level(verbose: Optional[str]) -> str:
+    """Effective level: ``--verbose`` > ``PROBESTACK_LOG_LEVEL`` > ``INFO``.
+
+    The flag is an explicit request for this run, so it beats the ambient
+    environment variable, in the same direction as every other knob.
+    """
+    if verbose:
+        return verbose.strip().upper()
+
+    env_level = os.environ.get("PROBESTACK_LOG_LEVEL", "").strip().upper()
+    if env_level in LOG_LEVELS:
+        return env_level
+    # An unparseable level is not worth failing a scan over, but going silent
+    # about it would be worse: the user would think they had set it.
+    if env_level:
+        logging.getLogger(__name__).warning(
+            "ignoring PROBESTACK_LOG_LEVEL=%r; expected one of %s",
+            env_level,
+            ", ".join(LOG_LEVELS),
+        )
+    return "INFO"
+
+
+def configure_logging(level: str) -> int:
+    """Apply ``level`` to the root logger, and return it as a number.
+
+    Nothing did this before: ``Config.log_level`` was resolved from the
+    environment and then never used, so ``PROBESTACK_LOG_LEVEL=DEBUG`` was
+    silently inert and every ``log.debug`` in the codebase was unreachable.
+
+    ``force=True`` replaces a handler another library installed (some
+    entry points do call ``basicConfig`` first); without it the first caller
+    wins and our level would be ignored.
+    """
+    numeric = logging.getLevelName(level.strip().upper())
+    if not isinstance(numeric, int):  # pragma: no cover - argparse validates
+        numeric = logging.INFO
+    logging.basicConfig(
+        level=numeric,
+        format="%(levelname)-8s %(name)s: %(message)s",
+        force=True,
+    )
+    return numeric
+
+
 @dataclass
 class Config:
     """Every runtime knob, fully resolved."""
@@ -398,7 +508,9 @@ class Config:
         if browser is not None and browser.lower() == "auto":
             browser = None
 
-        log_level = os.environ.get("PROBESTACK_LOG_LEVEL", "").strip().upper() or "INFO"
+        # --verbose > PROBESTACK_LOG_LEVEL > INFO.  The flag is the *explicit*
+        # request, so it wins; the environment is the ambient default.
+        log_level = _resolve_log_level(args.verbose)
 
         ssh_hop = args.ssh_hop or os.environ.get("SSH_HOP", "").strip() or None
 

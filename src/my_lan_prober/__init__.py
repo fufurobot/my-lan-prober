@@ -25,6 +25,7 @@ The package is layered:
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Sequence
 
 from .bridge import AsyncBridge, default_bridge
@@ -36,7 +37,7 @@ from .browsers import (
     installed_browsers,
     is_browser_installed,
 )
-from .config import Config, ensure_temp_env, parse_cli_args
+from .config import Config, configure_logging, ensure_temp_env, parse_cli_args
 from .dnsfetchers import (
     DnsTableFetcher,
     HostsFileFetcher,
@@ -113,6 +114,8 @@ from .sessions import (
 )
 
 __version__ = "0.1.0"
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "__version__",
@@ -243,8 +246,14 @@ def main(argv: Optional[Sequence[str]] = None):
     unusable inherited temp directory kills the browser launch inside
     ``asyncio``'s pipe creation, and no amount of Python-level care in the
     Playwright call site can repair that after the fact.
+
+    ``configure_logging`` runs as soon as the level is known, and *before* the
+    engine is built, so that everything the scan does — including the sources
+    it decides not to use — is reported at the level the user asked for.
     """
     load_env()
     ensure_temp_env()
     config = Config.resolve(argv)
+    configure_logging(config.log_level)
+    log.debug("resolved configuration: %r", config)
     return Engine(config).run()

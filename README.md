@@ -107,8 +107,14 @@ first-class abstractions for the things you keep re-implementing:
   in-memory if you skip it entirely.
 - 🧵 **One asyncio loop per process**, safely bridged to a sync API — no
   greenlets, no "sync API inside asyncio" errors.
-- 🧪 **Everything testable** — 569 tests; handlers, sessions, fetchers, the
+- 🧪 **Everything testable** — 1398 tests; handlers, sessions, fetchers, the
   scheduler and browser detection are independent and can be driven by hand.
+- 📣 **Every branch logs, enforced by a test.** A scanning tool that goes quiet
+  when something interesting happens is not debuggable in the field, so
+  `tests/test_logging_coverage.py` parses the whole `src/` tree with `ast` and
+  requires a logging call in *every* branch — `if`, `for`, `while`, `try`,
+  `except`, `with` and standalone `and`/`or`. Run it at
+  `--coverage-granularity=function` when branch-level is more than you want.
 
 ## Architecture
 

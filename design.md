@@ -831,19 +831,92 @@ of sources and merge them:
 
 ```python
 registry = default_fetcher_registry()
-registry.names()                      # ['dns', 'hosts', 'openwrt', 'resolved', 'ssh', 'tplogin', 'unix', 'windows']
+registry.names()                      # ['dns', 'hosts', 'mdns', 'openwrt', 'resolved', 'ssh', 'tplogin', 'unix', 'windows']
 registry.parse_selection("unix,dns")  # ['unix', 'dns']
 registry.parse_selection("all")       # every name
-registry.parse_selection("auto")      # the non-invasive set (no 'ssh')
+registry.parse_selection("auto")      # the non-invasive set (no 'ssh', no 'mdns')
 ```
 
 The registry is also the seam that keeps optional dependencies optional: a
 source whose library is missing reports itself `available() == False` rather
 than failing the run.
 
-Fallback chains (`>>`) still exist and still work for callers who want
-"first non-empty wins"; the engine no longer uses one, because discarding the
-other sources' findings was the bug.
+### 7g. Scheduling — why the chain is gone
+
+A fetcher is not something to walk a list of. It declares **when** it may run:
+
+```python
+class ARPTableFetcher(ABC):
+    priority: int = 0                      # a writable attribute, not a method
+
+    def dependency(self) -> Iterable[Any]: # any iterable; order is ignored
+        return ()
+```
+
+`priority` is an attribute because the union **rewrites** it: the value after a
+run is the level that was actually used. Only the *sign* of the initial value
+carries meaning.
+
+`PriorityGraph` solves the declarations into an execution plan:
+
+| Step | Rule |
+|---|---|
+| level | longest dependency path to a root, negated — so a dependency always holds a larger level than its dependent |
+| deferral | a negative initial priority is an implicit dependency on **every** non-negative fetcher |
+| collapse | distinct levels squeeze to consecutive integers, which may be negative |
+| run | levels from highest to lowest; every fetcher on a level runs concurrently |
+
+```mermaid
+flowchart TD
+    A["tplogin, unix, windows, hosts, dns<br/>level 0"] --> B["ssh expander<br/>level -1"]
+    A --> C["mdns discovery<br/>level -1"]
+```
+
+Deferral is a single shared shift of the whole negative group, not a per-node
+rewrite, so a deferred fetcher that depends on another deferred fetcher still
+runs after it. Cycles raise `DependencyCycle` naming the cycle: which edge to
+cut is a decision only the caller can make.
+
+`FetcherChain` is **not** in the engine's path. It had two defects a scan cares
+about — it discarded every source but the first that answered, and it waited
+serially for one source before trying the next. The class remains for a caller
+who explicitly wants that, and its docstring says so plainly.
+
+### 7h. Concurrency
+
+Sources are synchronous (Playwright's sync API refuses to run inside a live
+event loop), so each level is dispatched from the `AsyncBridge`'s loop into a
+thread pool:
+
+```python
+limiter = asyncio.Semaphore(self.max_task)
+
+async def guarded(fetcher):
+    async with limiter:
+        return await asyncio.to_thread(self._fetch_one, fetcher)
+
+results = default_bridge().run(asyncio.gather(*(guarded(f) for f in phase)))
+```
+
+`max_task` (`--max-task` / `ARP_MAX_TASK`) bounds how many run at once. One
+source failing is logged and skipped; its dependents still run, because a
+missing prerequisite degrades a result rather than cancelling work.
+
+### 7i. The `router` extra
+
+`my-lan-prober[router]` declares the three libraries the "get at my router"
+story needs, so a user does not have to assemble them:
+
+| capability | library | what it buys |
+|---|---|---|
+| scrape the UI | `playwright` | the DHCP lease table behind a web login |
+| walk over SSH | `asyncssh` | another host's neighbour table, and hops |
+| discover locally | `zeroconf` | mDNS names and addresses, with no server |
+
+The individual extras (`playwright`, `ssh`, `mdns`) remain for callers who need
+only one. `router.router_capabilities()` reports which are present and imports
+none of them at module scope — `import my_lan_prober` must work with no extras
+at all, which CI asserts.
 
 
 ---
@@ -876,20 +949,44 @@ flowchart LR
 | `--resolve-host` | `RESOLVE_HOSTS` | `tplogin.cn,localhost` |
 | `--output` | `OUTPUT_CSV` | `tplogin-arp-enriched.csv` |
 | `--fetcher` | `ARP_FETCHER` | `tplogin` (a comma-separated set, `all`, or `auto`) |
+| `--max-task` | `ARP_MAX_TASK` | `8` (sources in flight per level) |
 | `--ssh-hop` | `SSH_HOP` | none |
 | `--expand` | `ARP_EXPAND` | off |
 | `--expand-depth` | `ARP_EXPAND_DEPTH` | `2` (tables collected) |
 | `--unsafe-tplogin-password` | `TPLOGIN_PASSWORD` | prompt |
 | `--browser` | `PW_BROWSER` | auto (first installed of chromium/firefox/webkit) |
+| `--verbose [LEVEL]` | `PROBESTACK_LOG_LEVEL` | `INFO` (bare `--verbose` = `DEBUG`) |
+
+### 9a. `--verbose` takes an optional value
+
+`nargs="?"` cannot express this. It consumes any following token that does not
+look like an option, which makes `--verbose WARNING` and `--verbose localhost`
+indistinguishable — a typo'd level becomes a value and the run continues at a
+level nobody asked for — and it silently eats a positional.
+
+`_VerboseAction` consumes the next token **only when it is a known level name**:
+
+| invocation | result |
+|---|---|
+| `--verbose` | `DEBUG`, next token untouched |
+| `--verbose WARNING` | `WARNING` |
+| `--verbose=ERROR` | `ERROR` |
+| `--verbose --output x` | `DEBUG`, `--output` preserved |
+| `--verbose CHATTY` | rejected by argparse |
+| `-v -v` | `DEBUG` (repeating raises, never lowers) |
+
+`configure_logging()` then applies the level with `force=True`, because
+another library may already have installed a root handler and without `force`
+the earliest caller wins and the chosen level is silently ignored.
 
 ```mermaid
 flowchart TD
     A[Config] --> B["Root HandlerChain via << / >>"]
     A --> C["FetcherRegistry.parse_selection(fetcher)"]
     C --> C2["create() each named source"]
-    C2 --> C3["TableUnion → merged table (source/via/depth)"]
-    C3 --> C4["SSHArpTableExpander (only with --expand)"]
-    C4 --> D["merged DataFrame[ip, mac, mode, …]"]
+    C2 --> C3["PriorityGraph: dependency graph → levels"]
+    C3 --> C4["level by level, sources concurrent (max_task)"]
+    C4 --> D["merged DataFrame[ip, mac, mode, source, via, depth]"]
     D --> E["ThreadPoolExecutor(max_workers)"]
     E --> F["worker(target)"]
     F --> G["chain.handle(target)"]
@@ -954,16 +1051,22 @@ sequenceDiagram
 | **Persistor** | `Persistor` | ✔ | `history*`, `register*`, `store*`, `store_full`, `retrieve`, `persist*`, `resume*` |
 | | `PicklePersistor`, `JSONLPersistor`, `SQLitePersistor`, `ArrowPlasmaPersistor` | ✘ | disk-backed |
 | **Bridge** | `AsyncBridge` | ✘ | `run(coro)` |
-| **Fetcher** | `ARPTableFetcher` | ✔ | `iptable*`, `available`, `<<`, `>>` |
+| **Fetcher** | `ARPTableFetcher` | ✔ | `iptable*`, `available`, `dependency`, `priority`, `<<`, `>>` |
 | | `PlaywrightFetcher` | ✔ | `run*`, `driver_env`, `browser_engine_name` (was `_detect_latest_browser`) |
-| | `TPLoginFetcher`, `UnixArpFetcher`, `WindowsArpFetcher`, `OpenWRTFetcher`, `FetcherChain` | mixed | per-source; the chain skips `available() == False` |
+| | `TPLoginFetcher`, `UnixArpFetcher`, `WindowsArpFetcher` | ✘ | level 0; the fast local and router reads |
+| | `OpenWRTFetcher` | ✘ | level −1; needs credentials, so it goes last |
+| | `FetcherChain` | ✘ | legacy serial "first non-empty wins"; **not** the engine's path |
 | | `HostsFileFetcher`, `DnsTableFetcher`, `ResolvedHostFetcher` | ✘ | name → address, via `python-hosts` and `dnspython` (A **and** AAAA) |
+| | `MdnsFetcher` | ✘ | local discovery; address **and** hostname together; deferred |
 | **FQDN** | `FQDN` | ✘ | `str` subclass; `kind`, `hops`, `from_mac`, `apply_offset` |
 | **Expander** | `ArpTableExpander` | ✔ | `upstream`, `expand*`, provenance tagging, safe upstream calls |
-| | `TableUnion` | ✘ | merge everything, add nothing |
+| | `TableUnion` | ✘ | merge everything, **schedule** it, bound it with `max_task` |
 | | `SSHArpTableExpander` | ✘ | known-hosts walk, `asyncssh`, depth-bounded |
 | | `SSHHopExpander` | ✘ | explicit `bastion>jump>target` chain |
+| **Scheduling** | `PriorityGraph` | ✘ | `levels`, `assign`, `phases`, `plan` |
+| | `DependencyCycle` | ✘ | `ValueError` naming the cycle |
 | **Registry** | `FetcherRegistry` | ✘ | `register`, `create`, `available`, `parse_selection` |
+| **Router** | `router_capabilities`, `missing_capabilities`, `describe` | ✘ | which of Playwright / asyncssh / zeroconf are installed |
 | **Browsers** | `detect_browsers`, `first_available_browser` | ✘ | probes `executable_path` per engine |
 | **App** | `Config`, `Engine` | ✘ | — |
 
@@ -971,7 +1074,57 @@ sequenceDiagram
 
 ---
 
-## 12. Final Confirmations
+## 12. Logging: an enforced invariant
+
+A scanning tool that goes quiet when something interesting happens is not
+debuggable in the field: the one thing you need — *which source did it try, and
+why did it fail?* — is exactly what nobody logs. So "every branch logs" is a
+test, not a convention.
+
+`tests/test_logging_coverage.py` parses every module under `src/` with `ast`,
+enumerates its branches, and requires a logging call in each. It cannot be an
+ordinary behavioural test: a branch that was never taken is invisible when you
+call the code.
+
+| `--coverage-granularity` | pass condition |
+|---|---|
+| `branch` (default) | every branch body contains a logging call |
+| `function` | at least one branch in the function logs |
+| `class` | at least one branch in the class logs |
+| `module` | at least one branch in the module logs |
+
+Each unit is its own parametrised case, and a failure names the file, line,
+branch kind, enclosing function and a source snippet — the point is to fix it
+immediately, not to receive a count.
+
+### What counts as a branch
+
+`if`, `for`, `async for`, `while`, `try`, `except`, `with`, `async with`,
+`match`, and a **standalone** short-circuit `and`/`or`.
+
+A `BoolOp` that is the *test* of a control statement is **not** separate: it is
+part of that statement's single decision, and no log call can live inside a
+boolean expression. `if a and b:` is one branch, instrumented by logging in its
+body. Counting it twice was a bug the first version had — it demanded something
+impossible.
+
+### Using it
+
+```bash
+pytest tests/test_logging_coverage.py                          # every branch
+pytest tests/test_logging_coverage.py --coverage-granularity=function
+pytest tests/test_logging_coverage.py --coverage-min-level=WARNING
+```
+
+The options are declared in `conftest.py`, not in the test module:
+`pytest_addoption` is consulted on plugins and conftest files only, so a hook
+in a test module is never called. They are also namespaced `--coverage-*`
+because pytest already owns `--log-level` and re-declaring it is an argparse
+conflict that stops the run.
+
+---
+
+## 13. Final Confirmations
 
 1. **`SocketBannerHandler(stack, session, ...)`** — `session` is a pre-opened `Session` (usually `AsyncSocketSession` over a live socket). The handler attaches `_persistor` / `_on_io` / `_max_frame_size` to the top of that session. Confirm.
 2. **`_rebind_stack(new_stack)`** — walks to `session.root()` (live socket), then `SessionFactory.upgrade(root, extra)`. Confirm.

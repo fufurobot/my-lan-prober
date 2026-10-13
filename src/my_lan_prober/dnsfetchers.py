@@ -87,7 +87,9 @@ def _looks_like_address(value: str) -> bool:
     try:
         ipaddress.ip_address(value)
     except ValueError:
+        log.debug("%r is not a literal address; it will need a resolver", value)
         return False
+    log.debug("%r is already an address; no lookup needed", value)
     return True
 
 
@@ -97,11 +99,14 @@ def _dedupe(rows: Iterable[dict]) -> pd.DataFrame:
     unique: List[dict] = []
     for row in rows:
         if row["ip"] in seen:
+            log.debug("dropping duplicate address %s (already claimed)", row["ip"])
             continue
         seen.add(row["ip"])
         unique.append(row)
     if not unique:
+        log.debug("nothing resolved; returning an empty table")
         return _empty_table()
+    log.debug("deduplicated to %d address(es)", len(unique))
     return pd.DataFrame(unique)
 
 
@@ -122,10 +127,21 @@ def parse_hosts_entries(entries: Iterable[Any]) -> pd.DataFrame:
     for entry in entries:
         entry_type = getattr(entry, "entry_type", None)
         if entry_type not in ("ipv4", "ipv6"):
+            log.debug(
+                "skipping hosts entry with type %r; only ipv4/ipv6 carry an address", entry_type
+            )
             continue
         address = getattr(entry, "address", None)
-        names = list(getattr(entry, "names", None) or [])
+        raw_names = getattr(entry, "names", None)
+        if raw_names is None:
+            log.debug("hosts entry has no names attribute; treating it as nameless")
+            names: List[Any] = []
+        else:
+            names = list(raw_names)
         if not address or not names:
+            log.debug(
+                "skipping unnameable hosts entry (address=%r, %d name(s))", address, len(names)
+            )
             continue
         row = _row(str(address), host=str(names[0]), mode="hosts", source="hosts")
         row["aliases"] = ",".join(str(name) for name in names[1:])
@@ -133,8 +149,10 @@ def parse_hosts_entries(entries: Iterable[Any]) -> pd.DataFrame:
         rows.append(row)
 
     if not rows:
+        log.debug("the hosts file yielded no usable entries")
         frame = _empty_table()
         return frame
+    log.debug("hosts file yielded %d address(es)", len(rows))
     return pd.DataFrame(rows)
 
 
@@ -149,7 +167,8 @@ def _module_available(name: str) -> bool:
     """
     try:
         __import__(name)
-    except ImportError:
+    except ImportError as exc:
+        log.debug("optional dependency %r is not importable: %s", name, exc)
         return False
     return True
 
@@ -210,8 +229,10 @@ def resolve_names(
     for name in names:
         name = str(name).strip()
         if not name:
+            log.debug("skipping a blank name in the resolve list")
             continue
         if _looks_like_address(name):
+            log.debug("%s is a literal address; passing it through unresolved", name)
             resolved.append((name, name))
             continue
 
@@ -223,17 +244,32 @@ def resolve_names(
                     log.debug("DNS %s lookup for %s failed: %s", rdtype, name, exc)
                     continue
                 for answer in answers:
-                    address = getattr(answer, "address", None) or str(answer)
+                    answer_address = getattr(answer, "address", None)
+                    if answer_address is None:
+                        log.debug(
+                            "DNS %s answer for %s has no .address; using its text form",
+                            rdtype,
+                            name,
+                        )
+                        address = str(answer)
+                    else:
+                        address = answer_address
                     resolved.append((name, str(address)))
             if any(resolved_name == name for resolved_name, _ in resolved):
+                log.debug("%s was answered by the configured resolver; not falling back", name)
                 continue
+            log.debug("the configured resolver answered nothing for %s; trying the system", name)
 
         # Either there is no resolver, or it answered nothing: the system
         # resolver is the fallback, and on Windows it is the only one that
         # knows about the hosts file and the configured search suffixes.
+        if resolver is None or dns_rdatatype is None:
+            log.debug("no dnspython resolver available; %s used the system resolver only", name)
         for address in _system_resolve(name):
+            log.debug("system resolver produced %s for %s", address, name)
             resolved.append((name, address))
 
+    log.debug("resolved %d name(s) to %d address(es)", len(names), len(resolved))
     return resolved
 
 
@@ -241,7 +277,8 @@ def _rdatatypes() -> Optional[tuple]:
     """The two address families to query, or ``None`` without dnspython."""
     try:
         import dns.rdatatype
-    except ImportError:  # pragma: no cover - guarded by available()
+    except ImportError as exc:  # pragma: no cover - guarded by available()
+        log.debug("dnspython is not importable (%s); only the system resolver is usable", exc)
         return None
     return (dns.rdatatype.A, dns.rdatatype.AAAA)
 
@@ -258,6 +295,10 @@ def _system_resolve(name: str) -> List[str]:
         address = info[4][0]
         if address not in addresses:
             addresses.append(address)
+        else:
+            log.debug("system resolver returned %s for %s more than once", address, name)
+    if not addresses:
+        log.debug("the system resolver knows no address for %s", name)
     return addresses
 
 
@@ -286,6 +327,7 @@ class DnsTableFetcher(ARPTableFetcher):
             import dns.resolver
 
             self._resolver = dns.resolver.Resolver()
+            log.debug("built a default dns.resolver.Resolver for the dns source")
         return self._resolver
 
     def available(self) -> bool:
@@ -293,6 +335,8 @@ class DnsTableFetcher(ARPTableFetcher):
 
     def iptable(self) -> pd.DataFrame:
         active = self.resolver() if self.available() else None
+        if active is None:
+            log.debug("dnspython is unavailable; the dns source falls back to the system resolver")
         pairs = resolve_names(self.names, resolver=active, timeout=self.timeout)
         rows = [_row(address, host=name, mode="dns", source="dns") for name, address in pairs]
         if not rows:
@@ -320,13 +364,16 @@ class ResolvedHostFetcher(ARPTableFetcher):
         for name in self.names:
             name = str(name).strip()
             if not name:
+                log.debug("skipping a blank name in the resolve list")
                 continue
             if _looks_like_address(name):
+                log.debug("%s is a literal address; using it as-is", name)
                 rows.append(_row(name, host=name, mode="resolved", source="resolved"))
                 continue
 
             addresses = self._resolve(name)
             for address in addresses:
+                log.debug("%s resolved to %s", name, address)
                 rows.append(_row(address, host=name, mode="resolved", source="resolved"))
 
             if not addresses:
@@ -341,7 +388,10 @@ class ResolvedHostFetcher(ARPTableFetcher):
             for _name, address in resolve_names([name], resolver=self._resolver):
                 if address not in addresses:
                     addresses.append(address)
+                else:
+                    log.debug("configured resolver repeated %s for %s", address, name)
         if not addresses:
+            log.debug("configured resolver gave nothing for %s; trying the system resolver", name)
             addresses = _system_resolve(name)
         return addresses
 
@@ -350,5 +400,10 @@ def _configured_names() -> List[str]:
     """The names to resolve: ``RESOLVE_HOSTS``, else the ``probes`` default."""
     raw = os.environ.get("RESOLVE_HOSTS", "").strip()
     if raw:
-        return [name.strip() for name in raw.split(",") if name.strip()]
+        names = [name.strip() for name in raw.split(",") if name.strip()]
+        log.debug("RESOLVE_HOSTS names %d host(s): %s", len(names), ", ".join(names))
+        return names
+    log.debug(
+        "RESOLVE_HOSTS is unset; using the built-in default names: %s", ", ".join(RESOLVE_HOSTS)
+    )
     return list(RESOLVE_HOSTS)

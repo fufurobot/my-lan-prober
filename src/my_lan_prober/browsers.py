@@ -74,15 +74,38 @@ def is_browser_installed(browser_type: Any) -> bool:
     """
     try:
         raw = browser_type.executable_path
-    except Exception:
+    except Exception as exc:
         # A dead driver raises on attribute access; that is "not installed".
+        log.debug(
+            "engine %s reports no executable_path (%s: %s); treating it as not installed",
+            type(browser_type).__name__,
+            type(exc).__name__,
+            exc,
+        )
         return False
     if not raw:
+        log.debug(
+            "engine %s returned an empty executable_path; treating it as not installed "
+            "(an empty path would otherwise resolve to the cwd and look launchable)",
+            type(browser_type).__name__,
+        )
         return False
     try:
         # A directory is not launchable: we exec a file.
-        return Path(str(raw)).is_file()
-    except OSError:  # pragma: no cover - unreadable/invalid path
+        path = Path(str(raw))
+        installed = path.is_file()
+        log.debug(
+            "engine %s executable_path %s is_file=%s", type(browser_type).__name__, path, installed
+        )
+        return installed
+    except OSError as exc:  # pragma: no cover - unreadable/invalid path
+        log.debug(
+            "engine %s executable_path %r is unreadable (%s: %s); treating it as not installed",
+            type(browser_type).__name__,
+            raw,
+            type(exc).__name__,
+            exc,
+        )
         return False
 
 
@@ -112,13 +135,21 @@ def playwright_object() -> Optional[Any]:
         from .fetchers import _driver_env_applied
 
         env = {name: os.environ[name] for name in ("TMPDIR", "TMP", "TEMP") if name in os.environ}
+        log.debug("applying the driver environment %r before starting Playwright", env)
         context = _driver_env_applied(env)
     except ImportError:  # pragma: no cover - breaks a circular import
+        log.debug(
+            "could not import the driver environment hook (circular import); "
+            "starting Playwright with the inherited environment"
+        )
         context = contextlib.nullcontext()
 
     try:
         with context:
-            return sync_playwright().start()
+            log.debug("starting the Playwright driver")
+            playwright = sync_playwright().start()
+        log.debug("the Playwright driver started: %r", playwright)
+        return playwright
     except Exception as exc:
         log.warning("could not start the Playwright driver: %s", exc)
         return None
@@ -144,14 +175,26 @@ def detect_browsers(playwright: Optional[Any] = None) -> Dict[str, bool]:
             log.warning("could not start the Playwright driver: %s", exc)
             return detected
     if playwright is None:
+        log.debug("no Playwright driver available; reporting every engine as not installed")
         return detected
 
     for name in BROWSER_NAMES:
         engine = getattr(playwright, name, None)
-        detected[name] = engine is not None and is_browser_installed(engine)
+        if engine is None:
+            log.debug("engine %s is absent from the driver; treating it as not installed", name)
+            detected[name] = False
+            continue
+        detected[name] = is_browser_installed(engine)
         if detected[name]:
             log.debug("playwright engine %s is installed", name)
+        else:
+            log.debug(
+                "playwright engine %s is not installed (engine object=%r)",
+                name,
+                engine,
+            )
 
+    log.debug("browser detection result: %r", detected)
     return detected
 
 
@@ -163,8 +206,14 @@ def installed_browsers() -> Dict[str, bool]:
 def _engine_path(playwright: Any, name: str) -> str:
     engine = getattr(playwright, name, None)
     if engine is None:
+        log.debug("engine %s is absent from the driver; reporting no path", name)
         return ""
-    return str(getattr(engine, "executable_path", "") or "")
+    raw = getattr(engine, "executable_path", "")
+    if raw:
+        log.debug("engine %s executable_path=%s", name, raw)
+        return str(raw)
+    log.debug("engine %s has no executable_path set; reporting no path", name)
+    return ""
 
 
 def first_available_browser(
@@ -183,15 +232,23 @@ def first_available_browser(
             message names the missing engines and the command that fixes it.
     """
     candidates = tuple(order) if order else BROWSER_NAMES
+    log.debug("looking for an installed Playwright engine among %r", candidates)
 
     started = playwright is None
     if started:
+        log.debug("no Playwright driver was supplied; starting one to probe the engines")
         try:
             playwright = playwright_object()
         except Exception as exc:
+            log.warning("could not start the Playwright driver: %s", exc)
             raise BrowserNotInstalled(f"could not start the Playwright driver: {exc}") from exc
 
     if playwright is None:
+        log.warning(
+            "no browser engine can be used: the Playwright driver could not be started "
+            "and the optional extra may be missing (hint: %s)",
+            INSTALL_HINT,
+        )
         raise BrowserNotInstalled(
             "playwright could not be started, so no browser engine is available; "
             f"install the optional extra and run `{INSTALL_HINT}`"
@@ -200,9 +257,16 @@ def first_available_browser(
     # Read the paths while the driver is alive: a stopped driver raises or
     # returns nothing on attribute access, so probing it afterwards would
     # report "<not set>" for every engine and lose the useful diagnosis.
-    detail = ", ".join(
-        f"{name}={_engine_path(playwright, name) or '<not set>'}" for name in candidates
-    )
+    def _describe(name: str) -> str:
+        path = _engine_path(playwright, name)
+        if path:
+            log.debug("engine %s probe path: %s", name, path)
+            return f"{name}={path}"
+        log.debug("engine %s probe path: <not set>", name)
+        return f"{name}=<not set>"
+
+    detail = ", ".join(_describe(name) for name in candidates)
+    log.debug("engine executable paths before probing: %s", detail)
 
     try:
         for name in candidates:
@@ -210,11 +274,14 @@ def first_available_browser(
             if engine is not None and is_browser_installed(engine):
                 log.info("Using Playwright browser engine: %s", name)
                 return name
+            log.debug("skipping engine %s: not installed", name)
     finally:
         if started:
             # We started this driver purely to read executable paths.
+            log.debug("stopping the driver we started for this probe")
             _stop(playwright)
 
+    log.warning("no Playwright browser is installed (checked %s)", detail)
     raise BrowserNotInstalled(
         f"no Playwright browser is installed (checked {detail}); "
         f"run `{INSTALL_HINT}` to download one"
@@ -225,8 +292,10 @@ def _stop(playwright: Any) -> None:
     """Best-effort shutdown of a driver we started ourselves."""
     stop = getattr(playwright, "stop", None)
     if stop is None:
+        log.debug("driver %r has no stop(); nothing to shut down", type(playwright).__name__)
         return
     try:
+        log.debug("stopping the Playwright driver %r", type(playwright).__name__)
         stop()
     except Exception as exc:  # pragma: no cover - driver teardown is best-effort
         log.debug("could not stop the Playwright driver cleanly: %s", exc)

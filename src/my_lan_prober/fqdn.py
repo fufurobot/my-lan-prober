@@ -38,7 +38,10 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 from typing import ClassVar, Tuple
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "FQDN",
@@ -74,16 +77,49 @@ _HEX_DIGITS = set("0123456789abcdef")
 
 
 def _looks_like_mac(text: str) -> bool:
-    """Whether ``text`` is six hex octets with a consistent separator."""
+    """Whether ``text`` is six hex octets with a consistent separator.
+
+    Each test logs its own verdict at DEBUG.  Classification runs once per
+    value and a table is mostly addresses, so the lines are only visible with
+    ``--verbose``; when they are, they answer the question that actually gets
+    asked — "why is this string being treated as a hostname?".
+    """
     compact = text.replace(":", "").replace("-", "")
-    if len(compact) != 12 or not set(compact.lower()) <= _HEX_DIGITS:
+
+    # Split deliberately rather than `A or B`: the two halves fail for
+    # different reasons (wrong length vs. a non-hex character), and which one
+    # it was is the useful part of the message.
+    if len(compact) != 12:
+        log.debug("not a MAC: %r has %d hex digits, expected 12", text, len(compact))
         return False
-    if ":" in text and "-" in text:
+
+    if not set(compact.lower()) <= _HEX_DIGITS:
+        log.debug("not a MAC: %r contains a non-hex character", text)
         return False
-    if ":" not in text and "-" not in text:
+
+    # Each composite test is hoisted into a named value so the decision can be
+    # *logged*.  A bare `if a and b:` is its own branch as far as the coverage
+    # suite is concerned, and no log call can live inside a boolean
+    # expression — hoisting is the only way to say which case was hit.
+    has_colon = ":" in text
+    has_hyphen = "-" in text
+
+    if has_colon and has_hyphen:
+        log.debug("not a MAC: %r mixes ':' and '-' separators", text)
+        return False
+
+    if not has_colon and not has_hyphen:
+        log.debug("MAC %r written without separators", text)
         return True
-    separator = ":" if ":" in text else "-"
-    return all(len(octet) in (1, 2) for octet in text.split(separator))
+
+    separator = ":" if has_colon else "-"
+    octets = text.split(separator)
+    if not all(len(octet) in (1, 2) for octet in octets):
+        log.debug("not a MAC: %r has an octet that is not 1-2 digits", text)
+        return False
+
+    log.debug("MAC %r accepted (%d octets, %r separator)", text, len(octets), separator)
+    return True
 
 
 def _normalise_mac(text: str) -> str:
@@ -93,14 +129,22 @@ def _normalise_mac(text: str) -> str:
 
 def _classify(text: str) -> str:
     if not text:
+        log.debug("empty value classified as %s", KIND_UNKNOWN)
         return KIND_UNKNOWN
+
     if _looks_like_mac(text):
+        log.debug("%r classified as %s", text, KIND_MAC)
         return KIND_MAC
+
     try:
         address = ipaddress.ip_address(text)
     except ValueError:
+        log.debug("%r is not an address, classified as %s", text, KIND_HOSTNAME)
         return KIND_HOSTNAME
-    return KIND_IPV4 if address.version == 4 else KIND_IPV6
+
+    kind = KIND_IPV4 if address.version == 4 else KIND_IPV6
+    log.debug("%r classified as %s (v%d)", text, kind, address.version)
+    return kind
 
 
 class FQDN(str):
@@ -124,10 +168,13 @@ class FQDN(str):
         kind = _classify(text)
         normalised = _normalise_mac(text) if kind == KIND_MAC else text
 
-        if kind == KIND_IPV6:
+        if kind == KIND_MAC:
+            log.debug("normalised MAC %r -> %r", text, normalised)
+        elif kind == KIND_IPV6:
             # One address, one spelling: equality between an expanded and a
             # compressed IPv6 literal must not depend on how it was written.
             normalised = str(ipaddress.IPv6Address(text))
+            log.debug("normalised IPv6 %r -> %r", text, normalised)
 
         instance = super().__new__(cls, normalised)
         instance._kind = kind
@@ -164,17 +211,28 @@ class FQDN(str):
     def is_locally_administered(self) -> bool:
         """Whether a MAC is private/derived (IEEE 802 locally-administered bit)."""
         if not self.is_mac:
+            log.debug("%r is not a MAC; locality bit is undefined", self.value)
             return False
         first_octet = int(self.value.split(":")[0], 16)
-        return bool(first_octet & _LOCALLY_ADMINISTERED_BIT)
+        locally_administered = bool(first_octet & _LOCALLY_ADMINISTERED_BIT)
+        log.debug(
+            "MAC %s first octet 0x%02x -> locally-administered=%s",
+            self.value,
+            first_octet,
+            locally_administered,
+        )
+        return locally_administered
 
     @property
     def version(self) -> int:
         """IP version, or ``0`` for a MAC/name/unknown endpoint."""
         if self.is_ipv4:
+            log.debug("%s is IPv4", self.value)
             return 4
         if self.is_ipv6:
+            log.debug("%s is IPv6", self.value)
             return 6
+        log.debug("%r (%s) has no IP version", self.value, self._kind)
         return 0
 
     def as_address(self) -> ipaddress._BaseAddress:
@@ -230,21 +288,43 @@ class FQDN(str):
         the subnet it was found in.
         """
         if self.is_mac:
+            log.debug("refusing to offset MAC %s", self.value)
             raise ValueError("a mac address has no offset arithmetic; derive an address instead")
+
         if self.is_hostname:
+            log.debug("refusing to offset hostname %s", self.value)
             raise ValueError("a hostname has no offset arithmetic; resolve it instead")
+
         if self.kind == KIND_UNKNOWN:
+            log.debug("offsetting an unknown endpoint yields another")
             return FQDN("")
+
         if offset == 0:
+            log.debug("%s unchanged by a zero offset", self.value)
             return FQDN(self.value)
 
         if self.is_ipv6:
             address = ipaddress.IPv6Address(self.value)
             moved = (int(address) + offset) % (1 << 128)
-            return FQDN(str(ipaddress.IPv6Address(moved)))
+            result = FQDN(str(ipaddress.IPv6Address(moved)))
+            log.debug("offset IPv6 %s by %+d -> %s", self.value, offset, result)
+            return result
 
         address = ipaddress.IPv4Address(self.value)
         network = ipaddress.ip_network(f"{self.value}/24", strict=False)
         base = int(network.network_address)
+        # The modulo is the wrap: a host part that would overflow stays inside
+        # the /24 it was found in rather than leaking into the next subnet.
         moved = base + ((int(address) - base + offset) % 256)
-        return FQDN(str(ipaddress.IPv4Address(moved)))
+        result = FQDN(str(ipaddress.IPv4Address(moved)))
+        if result == self.value:
+            log.debug("offset IPv4 %s by %+d wrapped back onto itself", self.value, offset)
+        else:
+            log.debug(
+                "offset IPv4 %s by %+d -> %s (wrapped in %s)",
+                self.value,
+                offset,
+                result,
+                network,
+            )
+        return result

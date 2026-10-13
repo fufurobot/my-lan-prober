@@ -81,10 +81,28 @@ class Handler(ABC):
         return None
 
     def handle_banner(self, banner: bytes, port: Optional[int] = None) -> ScanResult:
+        # ``banner or b""`` is a decision point: a caller may pass None.  The
+        # log is the falsy operand, so it fires exactly when the substitution
+        # happens without adding a branch.
+        banner = (
+            banner
+            or log.debug(
+                "%s got an empty banner for port %s; substituting b''",
+                type(self).__name__,
+                port,
+            )
+            or b""
+        )
+        log.debug(
+            "%s has no banner handling; reporting no service for port %s (%d byte(s))",
+            type(self).__name__,
+            port,
+            len(banner),
+        )
         return ScanResult(
             port=port,
             service=None,
-            banner=banner or b"",
+            banner=banner,
         )
 
     @abstractmethod
@@ -147,11 +165,23 @@ class RegexBannerHandler(Handler):
     ) -> None:
         if isinstance(pattern, (bytes, str)):
             flags = re.IGNORECASE if isinstance(pattern, str) else 0
+            log.debug(
+                "compiling the %s pattern for %s with flags=%d",
+                type(pattern).__name__,
+                name,
+                flags,
+            )
             self._pattern = re.compile(pattern, flags)
         else:
+            log.debug("using the pre-compiled pattern supplied for %s", name)
             self._pattern = pattern
         self._name = name
         self.REQUIRED_STACK = list(stack) if stack else None
+        log.debug(
+            "regex handler %s needs stack %s",
+            name,
+            self.REQUIRED_STACK if self.REQUIRED_STACK else "none",
+        )
 
     def ports(self) -> Optional[Sequence[int]]:
         return None
@@ -159,6 +189,9 @@ class RegexBannerHandler(Handler):
     def description(self) -> str:
         pattern = getattr(self._pattern, "pattern", self._pattern)
         if isinstance(pattern, bytes):
+            log.debug(
+                "decoding the %s pattern of %s for display", type(pattern).__name__, self._name
+            )
             pattern = pattern.decode("utf-8", "replace")
         return f"regex:{pattern} → {self._name}"
 
@@ -166,27 +199,85 @@ class RegexBannerHandler(Handler):
         try:
             pattern = self._pattern.pattern
             if isinstance(pattern, bytes):
-                haystack: Any = banner or b""
+                # ``banner or b""`` is a decision point: a falsy banner means
+                # match against the empty string.  The log is the falsy
+                # operand, so it fires exactly when the substitution happens.
+                haystack: Any = (
+                    banner
+                    or log.debug(
+                        "%s got an empty banner; matching against b''",
+                        self._name,
+                    )
+                    or b""
+                )
+                log.debug("matching %s against %d raw byte(s)", self._name, len(haystack))
             else:
-                haystack = (banner or b"").decode("utf-8", "ignore")
+                haystack = (
+                    banner
+                    or log.debug(
+                        "%s got an empty banner; decoding b'' for a text match",
+                        self._name,
+                    )
+                    or b""
+                ).decode("utf-8", "ignore")
+                log.debug(
+                    "matching %s against a %d-character decoded banner", self._name, len(haystack)
+                )
             return bool(self._pattern.search(haystack))
         except Exception:
+            log.debug(
+                "banner check for %s raised; declining the banner rather than propagating",
+                self._name,
+                exc_info=True,
+            )
             return False
 
     def load_full(self, payload: bytes) -> Optional[dict]:
+        # ``payload or b""`` is a decision point: a falsy payload yields an
+        # empty banner field.  The log is the falsy operand.
+        payload = (
+            payload
+            or log.debug(
+                "%s has no payload to load; recording an empty banner row",
+                self._name,
+            )
+            or b""
+        )
+        log.debug(
+            "loading a full row for %s from %d byte(s), truncated to 1024",
+            self._name,
+            len(payload),
+        )
         return {
             "service": self._name,
-            "banner": (payload or b"")[:1024].decode("utf-8", "ignore"),
+            "banner": payload[:1024].decode("utf-8", "ignore"),
         }
 
     def handle_banner(self, banner: bytes, port: Optional[int] = None) -> ScanResult:
-        return ScanResult(port=port, service=self._name, banner=banner or b"")
+        banner = (
+            banner
+            or log.debug(
+                "regex %s got an empty banner for port %s; reporting it as-is",
+                self._name,
+                port,
+            )
+            or b""
+        )
+        log.debug(
+            "regex %s claims port %s on a %d-byte banner",
+            self._name,
+            port,
+            len(banner),
+        )
+        return ScanResult(port=port, service=self._name, banner=banner)
 
     async def ahandle(self, target: Any, *args: Any, **kwargs: Any) -> Any:
         """Decline banners this handler does not match."""
         banner = kwargs.get("banner", b"")
         if not self.check_banner(banner):
+            log.debug("regex %s did not match the banner; declining", self._name)
             return None
+        log.debug("regex %s matched the banner; claiming port %s", self._name, kwargs.get("port"))
         return self.handle_banner(banner, kwargs.get("port"))
 
     def handle(self, target: Any, *args: Any, **kwargs: Any) -> Optional[ScanResult]:
@@ -200,9 +291,15 @@ def _flatten(handlers: Sequence[Any]) -> List[Handler]:
     flat: List[Handler] = []
     for handler in handlers:
         if isinstance(handler, HandlerChain):
+            log.debug(
+                "flattening a nested HandlerChain of %d handler(s) into this one",
+                len(handler._handlers),
+            )
             flat.extend(handler._handlers)
         else:
+            log.debug("keeping %s as a leaf handler", type(handler).__name__)
             flat.append(handler)
+    log.debug("flattened %d handler(s) into a %d-entry chain", len(handlers), len(flat))
     return flat
 
 
@@ -220,12 +317,23 @@ class HandlerChain(HandlerDispatcher):
         for handler in self._handlers:
             ports = handler.ports()
             if ports is None:
+                log.debug(
+                    "%s is port-agnostic; it adds no port to the chain",
+                    type(handler).__name__,
+                )
                 continue
             for port in ports:
                 if port not in seen:
                     seen.add(port)
                     out.append(port)
-        return out or None
+                    log.debug("port %d contributed by %s", port, type(handler).__name__)
+                else:
+                    log.debug("port %d already in the chain; ignoring the duplicate", port)
+        log.debug("chain covers %d distinct port(s)", len(out))
+        # ``out or None`` is a decision point: an empty port set means "any
+        # port", which the caller distinguishes from a list.  The log is the
+        # falsy operand.
+        return out or log.debug("no handler declared a port; the chain matches any port") or None
 
     def description(self) -> str:
         return " → ".join(handler.description() for handler in self._handlers)
@@ -251,7 +359,20 @@ class HandlerChain(HandlerDispatcher):
         for handler in self._handlers:
             result = await handler.ahandle(target, *args, **kwargs)
             if result is not None:
+                log.debug(
+                    "%s returned a result for %r; stopping the chain of %d",
+                    type(handler).__name__,
+                    target,
+                    len(self._handlers),
+                )
                 return result
+            log.debug(
+                "%s declined %r; trying the next of %d handler(s)",
+                type(handler).__name__,
+                target,
+                len(self._handlers),
+            )
+        log.debug("no handler in the chain of %d claimed %r", len(self._handlers), target)
         return None
 
     def handle(self, target: Any, *args: Any, **kwargs: Any) -> Any:
@@ -287,7 +408,21 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
         self._session._max_frame_size = max_frame_size
         self._session._on_io = self._on_io
 
-        for child in children or ():
+        provided = (
+            children
+            or log.debug(
+                "socket banner handler built without child handlers; it will label banners itself"
+            )
+            or ()
+        )
+        log.debug(
+            "socket banner handler on stack %s with %d child handler(s) and a %d-byte probe",
+            self._stack,
+            len(provided),
+            len(probe),
+        )
+        for child in provided:
+            log.debug("attaching child %s to the socket banner handler", type(child).__name__)
             self += child
 
     # -- metadata ------------------------------------------------------
@@ -324,13 +459,25 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
     # -- persistence hook ----------------------------------------------
     def _on_io(self, direction: str, payload: bytes) -> None:
         if direction != "recv":
+            log.debug(
+                "ignoring a %s I/O event of %d byte(s); only recv feeds the banner",
+                direction,
+                len(payload),
+            )
             return
         self._glue.extend(payload)
+        log.debug(
+            "glued %d byte(s); the banner buffer is now %d byte(s)", len(payload), len(self._glue)
+        )
         parsed = self.load_full(bytes(self._glue))
         if parsed is None:
+            log.debug("nothing to persist from a %d-byte banner", len(self._glue))
             return
         if self._persistor is not None:
+            log.debug("persisting a %d-field row parsed from the banner", len(parsed))
             self._persistor.store_full(parsed)
+        else:
+            log.debug("no persistor attached; the %d-field banner row is dropped", len(parsed))
 
     def load_full(self, payload: bytes) -> Optional[dict]:
         return {
@@ -340,6 +487,13 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
 
     def handle_banner(self, banner: bytes, port: Optional[int] = None) -> ScanResult:
         service = self._stack[-1] if self._stack else None
+        log.debug(
+            "no child claimed port %s; labelling the %d-byte banner as %s from stack %s",
+            port,
+            len(banner),
+            service,
+            self._stack,
+        )
         return ScanResult(port=port, service=service, banner=banner)
 
     # -- stack rebinding ------------------------------------------------
@@ -356,9 +510,21 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
         base_len = len(self._stack)
         extra = list(new_stack)[base_len:]
         if not extra:
+            log.debug(
+                "stack %s asks for nothing beyond the %d live layer(s); not rebinding",
+                list(new_stack),
+                base_len,
+            )
             self._stack = list(new_stack)
             return
 
+        log.debug(
+            "rebinding: %d new layer(s) %s on top of the %d live layer(s) over root %s",
+            len(extra),
+            extra,
+            base_len,
+            type(root).__name__,
+        )
         self._session._persistor = None
         new_top = SessionFactory.upgrade(
             root,
@@ -369,10 +535,12 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
         new_top._on_io = self._on_io
         self._stack = list(new_stack)
         self._session = new_top
+        log.debug("live session is now %s on stack %s", type(new_top).__name__, self._stack)
 
     # -- execution ------------------------------------------------------
     async def ahandle(self, target: Any, *args: Any, **kwargs: Any) -> Any:
         port = kwargs.pop("port", None)
+        log.debug("probing %r on port %s with a %d-byte probe", target, port, len(self._probe))
         await self._session.send_async(self._probe)
 
         # Drain whatever the peer volunteers, so the banner is fully glued
@@ -380,17 +548,40 @@ class SocketBannerHandler(ContextfulHandler, HandlerDispatcher):
         while True:
             frames = await self._session.read_async()
             if frames is None:
+                log.debug(
+                    "peer went quiet after %d glued byte(s); the banner is complete",
+                    len(self._glue),
+                )
                 break
+            log.debug("drained %d frame(s) while collecting the banner", len(frames))
 
         banner = bytes(self._glue)
+        log.debug(
+            "dispatching a %d-byte banner to %d child handler(s)", len(banner), len(self._children)
+        )
 
         for child in self._children:
             if not child.check_banner(banner):
+                log.debug(
+                    "%s did not match the %d-byte banner; trying the next child",
+                    type(child).__name__,
+                    len(banner),
+                )
                 continue
+            log.debug("%s matched the banner for port %s", type(child).__name__, port)
             deeper = getattr(child, "REQUIRED_STACK", None)
             if deeper and list(deeper) != self._stack:
+                log.debug(
+                    "%s needs stack %s, not the live %s; rebinding before dispatch",
+                    type(child).__name__,
+                    list(deeper),
+                    self._stack,
+                )
                 self._rebind_stack(deeper)
             return await child.ahandle(target, *args, port=port, banner=banner, **kwargs)
+        log.debug(
+            "no child of %d matched the banner; falling back to this handler", len(self._children)
+        )
         return self.handle_banner(banner, port)
 
     def handle(self, target: Any, *args: Any, **kwargs: Any) -> Any:

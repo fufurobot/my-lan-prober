@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import socket
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional
 
 from .bridge import default_bridge
 from .layers import LayerSpec, SessionRegistry
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "Session",
@@ -50,6 +53,13 @@ class Session(ABC):
         self._persistor = persistor
         self._max_frame_size = max_frame_size
         self._on_io: Optional[Callable[[str, bytes], None]] = None
+        log.debug(
+            "%s created with base=%s persistor=%s max_frame_size=%s",
+            type(self).__name__,
+            type(base).__name__ if base is not None else None,
+            type(persistor).__name__ if persistor is not None else None,
+            max_frame_size,
+        )
 
     # -- transport -----------------------------------------------------
     @abstractmethod
@@ -62,20 +72,45 @@ class Session(ABC):
         """The bottom-most session — the one holding the live socket."""
         session = self
         while session._base is not None:
+            log.debug(
+                "root(): %s has a base layer, descending to %s",
+                type(session).__name__,
+                type(session._base).__name__,
+            )
             session = session._base
+        log.debug("root(): bottom of the stack is %s", type(session).__name__)
         return session
 
     # -- persistence ---------------------------------------------------
     def history(self) -> Any:
         """Parsed packets recorded by this session's persistor."""
         if self._persistor is None:
+            log.debug("history(): %s has no persistor; returning nothing", type(self).__name__)
             return []
+        log.debug(
+            "history(): delegating to the %s persistor on %s",
+            type(self._persistor).__name__,
+            type(self).__name__,
+        )
         return self._persistor.history()
 
     def _fire_io(self, direction: str, payload: bytes) -> None:
         """Notify the owner of an I/O event (``"send"`` / ``"recv"``)."""
         if self._on_io is not None:
+            log.debug(
+                "firing %s I/O hook on %s with %d byte(s)",
+                direction,
+                type(self).__name__,
+                len(payload),
+            )
             self._on_io(direction, payload)
+        else:
+            log.debug(
+                "no I/O hook attached to %s; dropping the %s event (%d byte(s))",
+                type(self).__name__,
+                direction,
+                len(payload),
+            )
 
 
 class AsyncSession(Session, ABC):
@@ -101,13 +136,34 @@ class AsyncSession(Session, ABC):
     # -- helpers for concrete transports -------------------------------
     async def _send_down(self, data: bytes) -> None:
         if self._base is not None:
+            log.debug(
+                "sending %d byte(s) down from %s to the %s base layer",
+                len(data),
+                type(self).__name__,
+                type(self._base).__name__,
+            )
             await self._base.send_async(data)
         else:  # pragma: no cover - a root async session must override this
+            log.debug(
+                "%s is the bottom of the stack; it has no base layer to send %d byte(s) to",
+                type(self).__name__,
+                len(data),
+            )
             raise NotImplementedError("root session cannot send")
 
     async def _read_up(self, recv_debounce_seconds: float = DEFAULT_RECV_DEBOUNCE):
         if self._base is not None:
+            log.debug(
+                "reading up into %s via its %s base layer (debounce=%.3fs)",
+                type(self).__name__,
+                type(self._base).__name__,
+                recv_debounce_seconds,
+            )
             return await self._base.read_async(recv_debounce_seconds)
+        log.debug(
+            "%s is the bottom of the stack; it has no base layer to read from",
+            type(self).__name__,
+        )
         raise NotImplementedError("root session cannot read")
 
 
@@ -129,11 +185,19 @@ class TableSession(AsyncSession):
 
     async def _ensure_open(self) -> None:
         if self._handshake_sent or self.spec.handshake_out is None:
+            log.debug(
+                "no handshake to send on %s: already_sent=%s handshake_out=%s",
+                self.spec.name,
+                self._handshake_sent,
+                self.spec.handshake_out,
+            )
             return
         handshake = self.spec.handshake_out
         if callable(handshake):
+            log.debug("layer %s supplies a callable handshake; invoking it", self.spec.name)
             handshake = handshake()
         self._handshake_sent = True
+        log.debug("sending the %d-byte %s handshake down the stack", len(handshake), self.spec.name)
         await self._send_down(handshake)
         self._fire_io("send", handshake)
 
@@ -141,28 +205,61 @@ class TableSession(AsyncSession):
         await self._ensure_open()
         wire = data
         if self.spec.transform_out is not None:
+            log.debug("layer %s transforms %d byte(s) on the way out", self.spec.name, len(wire))
             wire = self.spec.transform_out(wire)
         wire = self.spec.framing.encode(wire)
+        log.debug(
+            "layer %s framed %d byte(s) into %d wire byte(s)",
+            self.spec.name,
+            len(data),
+            len(wire),
+        )
         await self._send_down(wire)
         self._fire_io("send", wire)
 
     async def read_async(self, recv_debounce_seconds: float = DEFAULT_RECV_DEBOUNCE):
         raw = await self._read_up(recv_debounce_seconds)
         if raw:
+            log.debug(
+                "layer %s received %d raw byte(s); appending to a %d-byte buffer",
+                self.spec.name,
+                len(raw),
+                len(self._inbuf),
+            )
             self._inbuf.extend(raw)
             self._fire_io("recv", raw)
         if not self._inbuf:
+            log.debug("layer %s has an empty buffer after reading; returning None", self.spec.name)
             return None
         frames = self.spec.framing.frame(self._inbuf)
         if not frames:
+            log.debug(
+                "layer %s framed nothing from %d buffered byte(s); waiting for more",
+                self.spec.name,
+                len(self._inbuf),
+            )
             return None
+        log.debug(
+            "layer %s framed %d message(s), %d byte(s) left buffered",
+            self.spec.name,
+            len(frames),
+            len(self._inbuf),
+        )
         if self.spec.transform_in is not None:
+            log.debug("layer %s transforms %d frame(s) on the way in", self.spec.name, len(frames))
             frames = [self.spec.transform_in(frame) for frame in frames]
         return frames
 
     def close(self) -> None:
         if self._base is not None:
+            log.debug(
+                "closing %s, which owns the %s base layer",
+                self.spec.name,
+                type(self._base).__name__,
+            )
             self._base.close()
+        else:
+            log.debug("closing %s; it sits directly on the transport", self.spec.name)
 
 
 class AsyncSocketSession(AsyncSession):
@@ -185,8 +282,18 @@ class AsyncSocketSession(AsyncSession):
         self._owns_socket = sock is None
         if sock is None:
             if host is None or port is None:
+                log.debug(
+                    "AsyncSocketSession needs a socket or a (host, port); got %r, %r",
+                    host,
+                    port,
+                )
                 raise ValueError("either sock or (host, port) is required")
+            log.debug(
+                "dialling %s:%s with a %.1fs timeout on behalf of the session", host, port, timeout
+            )
             sock = socket.create_connection((host, port), timeout=timeout)
+        else:
+            log.debug("adopting a caller-supplied socket; this session will close it")
         self._sock = sock
 
     async def send_async(self, data: bytes, recv_debounce_seconds: float = DEFAULT_RECV_DEBOUNCE):
@@ -201,10 +308,20 @@ class AsyncSocketSession(AsyncSession):
                 loop.sock_recv(self._sock, 65536), timeout=recv_debounce_seconds
             )
         except (asyncio.TimeoutError, TimeoutError):
+            log.debug(
+                "socket read timed out after %.3fs with nothing received; returning None",
+                recv_debounce_seconds,
+            )
             return None
         except OSError:
+            log.debug(
+                "socket read on %s:%s failed at the OS level; treating it as end of stream",
+                self.host,
+                self.port,
+            )
             return None
         if not raw:
+            log.debug("peer at %s:%s closed the connection; returning None", self.host, self.port)
             return None
         self._fire_io("recv", raw)
         return raw
@@ -212,8 +329,14 @@ class AsyncSocketSession(AsyncSession):
     def close(self) -> None:
         with contextlib.suppress(OSError):
             self._sock.close()
+            log.debug("closed the socket for %s:%s", self.host, self.port)
         if self._base is not None:
+            log.debug(
+                "closing the %s base layer under the socket session", type(self._base).__name__
+            )
             self._base.close()
+        else:
+            log.debug("socket session %s:%s has no base layer to close", self.host, self.port)
 
 
 class SessionFactory:
@@ -236,15 +359,28 @@ class SessionFactory:
         layer's ``override_class``) sitting on the transport.
         """
         if not stack:
+            log.warning("cannot build a session from an empty stack")
             raise ValueError("empty stack")
 
         root_spec = SessionRegistry.get(stack[0])
         if root_session is None:
+            log.debug("no root session supplied; instantiating the %s transport", root_spec.name)
             root_session = SessionFactory._instantiate_root(root_spec, root_kwargs)
+        else:
+            log.debug(
+                "reusing the caller's %s as the live transport for stack %s",
+                type(root_session).__name__,
+                stack,
+            )
 
         # Persistence lives at the top of the stack only, so the first layer
         # gets it only when it *is* the top (a single-layer build).
         single = len(stack) == 1
+        log.debug(
+            "building stack %s (%d layer(s)); persistence applies only at the top",
+            stack,
+            len(stack),
+        )
         top = SessionFactory._instantiate(
             root_spec,
             base=root_session,
@@ -268,15 +404,32 @@ class SessionFactory:
     ) -> AsyncSession:
         """Wrap ``base`` in ``extra`` layers, persisting only at the top."""
         if not extra:
+            log.debug(
+                "upgrade(): nothing above %s; persistence and max_frame_size set in place",
+                type(base).__name__,
+            )
             base._persistor = persistor
             base._max_frame_size = max_frame_size
             return base  # type: ignore[return-value]
 
         top: Session = base
         last = len(extra) - 1
+        log.debug(
+            "upgrade(): wrapping %s in %d extra layer(s): %s",
+            type(base).__name__,
+            len(extra),
+            extra,
+        )
         for index, name in enumerate(extra):
             spec = SessionRegistry.get(name)
             is_top = index == last
+            log.debug(
+                "upgrade(): layer %d/%d %s is_top=%s",
+                index + 1,
+                len(extra),
+                name,
+                is_top,
+            )
             top = SessionFactory._instantiate(
                 spec,
                 base=top,
@@ -294,13 +447,28 @@ class SessionFactory:
         ``TableSession`` that ``build`` stacks on top of them.
         """
         if spec.name in ("TCP", "UDP"):
+            log.debug(
+                "root layer %s is a plain socket transport; using AsyncSocketSession", spec.name
+            )
             return AsyncSocketSession(**root_kwargs)
         if spec.override_class is not None:
+            log.debug(
+                "root layer %s supplies its own transport %s",
+                spec.name,
+                spec.override_class.__name__,
+            )
             return spec.override_class(spec=spec, **root_kwargs)
+        log.debug("root layer %s has no override; falling back to AsyncSocketSession", spec.name)
         return AsyncSocketSession(**root_kwargs)
 
     @staticmethod
     def _instantiate(spec: LayerSpec, *, base: Session, **kwargs: Any) -> Session:
         if spec.override_class is not None:
+            log.debug(
+                "layer %s overrides the session class with %s",
+                spec.name,
+                spec.override_class.__name__,
+            )
             return spec.override_class(spec=spec, base=base, **kwargs)
+        log.debug("layer %s uses a table-driven TableSession", spec.name)
         return TableSession(spec=spec, base=base, **kwargs)

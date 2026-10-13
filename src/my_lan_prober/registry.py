@@ -86,6 +86,12 @@ class FetcherRegistry:
         try:
             factory = self._factories[name]
         except KeyError:
+            log.warning(
+                "unknown ARP source %r; %d source(s) are registered: %s",
+                name,
+                len(self._factories),
+                ", ".join(self.names()),
+            )
             raise KeyError(
                 f"unknown ARP source {name!r}; known sources: {', '.join(self.names())}"
             ) from None
@@ -122,19 +128,41 @@ class FetcherRegistry:
         means the non-invasive set — a scan must not start logging into other
         people's machines because nobody passed a flag.
         """
-        raw = (selection or "").strip()
+        if selection is None:
+            raw = ""
+            log.debug("no --fetcher given; falling back to the non-invasive set")
+        else:
+            raw = selection.strip()
         if not raw or raw == "auto":
-            return [name for name in self.names() if name in AUTO_SOURCES]
+            chosen = [name for name in self.names() if name in AUTO_SOURCES]
+            log.debug(
+                "selection %r is the non-invasive default; %d of %d source(s): %s",
+                selection,
+                len(chosen),
+                len(self._factories),
+                ", ".join(chosen),
+            )
+            return chosen
         if raw == "all":
+            log.debug(
+                "selection 'all' expands to every registered source: %s", ", ".join(self.names())
+            )
             return self.names()
 
         names = [part.strip() for part in raw.split(",") if part.strip()]
         unknown = [name for name in names if name not in self._factories]
         if unknown:
+            log.warning(
+                "selection %r names %d unknown source(s): %s",
+                selection,
+                len(unknown),
+                ", ".join(repr(name) for name in unknown),
+            )
             raise KeyError(
                 f"unknown ARP source {', '.join(repr(name) for name in unknown)}; "
                 f"known sources: {', '.join(self.names())}"
             )
+        log.debug("selection %r resolved to %s", selection, ", ".join(names))
         return names
 
 
@@ -191,11 +219,18 @@ def _ssh(**kwargs: Any) -> ARPTableFetcher:
     from .expanders import SSHArpTableExpander
     from .fetchers import UnixArpFetcher as _Local
 
+    raw_depth = kwargs.get("expand_depth")
+    if raw_depth:
+        depth = int(raw_depth)
+    else:
+        depth = 1
+        log.debug("no --expand-depth given; the SSH walk collects %d neighbour table(s)", depth)
+    log.debug("building the ssh source (hop=%r, depth=%d)", kwargs.get("ssh_hop"), depth)
     return SSHArpTableExpander(
         [_Local()],
         hop=kwargs.get("ssh_hop"),
         enabled=bool(kwargs.get("expand")),
-        max_depth=int(kwargs.get("expand_depth") or 1),
+        max_depth=depth,
         username=kwargs.get("ssh_user"),
     )
 

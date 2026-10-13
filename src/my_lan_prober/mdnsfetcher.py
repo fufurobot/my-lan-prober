@@ -69,7 +69,11 @@ def _empty_table() -> pd.DataFrame:
 
 def _strip_dot(value: Any) -> str:
     """mDNS names are fully qualified; the trailing dot is not part of a name."""
-    text = str(value or "").strip()
+    if value is None:
+        log.debug("no mDNS name to strip; treating it as empty")
+        text = ""
+    else:
+        text = str(value).strip()
     return text[:-1] if text.endswith(".") else text
 
 
@@ -99,7 +103,12 @@ def _addresses_of(info: Any) -> List[str]:
                 log.debug("mDNS %s() failed: %s", attribute, exc)
                 continue
             if values:
+                log.debug("mDNS answer carried %d address(es) via %s()", len(values), attribute)
                 return values
+            log.debug("mDNS %s() returned no usable addresses; trying the next accessor", attribute)
+        else:
+            log.debug("mDNS answer has no callable %s(); skipping that accessor", attribute)
+    log.debug("mDNS answer carried no addresses in either family")
     return []
 
 
@@ -116,36 +125,81 @@ def parse_service_info(infos: Iterable[Any]) -> pd.DataFrame:
     for info in infos:
         addresses = _addresses_of(info)
         if not addresses:
+            log.debug("skipping an mDNS answer that carries no address")
             continue
 
-        hostname = _strip_dot(getattr(info, "server", None) or getattr(info, "name", None) or "")
-        alias = _service_label(getattr(info, "name", "") or "")
-        aliases = [alias] if alias and alias != hostname else []
-        for extra in getattr(info, "aliases", None) or []:
+        server = getattr(info, "server", None)
+        if server is None:
+            log.debug("mDNS answer advertises no server name; falling back to its instance name")
+            server = getattr(info, "name", None)
+        if server is None:
+            log.debug("mDNS answer has no name at all; its addresses will stand in for one")
+            hostname = ""
+        else:
+            log.debug(
+                "mDNS answer names itself %s after stripping the root dot", _strip_dot(server)
+            )
+            hostname = _strip_dot(server)
+        raw_instance = getattr(info, "name", None)
+        if raw_instance is None:
+            log.debug("mDNS answer for %s advertises no instance name either", hostname)
+            instance = ""
+        else:
+            instance = raw_instance
+        alias = _service_label(instance)
+        if alias and alias != hostname:
+            aliases = [alias]
+        else:
+            aliases = []
+            log.debug("no distinct service label for %s; the hostname already says it", hostname)
+        raw_extras = getattr(info, "aliases", None)
+        if raw_extras is None:
+            log.debug("mDNS answer for %s carries no extra aliases", hostname)
+            raw_extras = []
+        for extra in raw_extras:
             cleaned = _strip_dot(extra)
             if cleaned and cleaned != hostname and cleaned not in aliases:
                 aliases.append(cleaned)
+            else:
+                log.debug(
+                    "dropping mDNS alias %r for %s: empty, the hostname, or a duplicate",
+                    cleaned,
+                    hostname,
+                )
 
         for address in addresses:
             if address in seen:
+                log.debug("mDNS address %s already claimed by an earlier answer", address)
                 continue
             seen.add(address)
+            if hostname:
+                label = hostname
+            else:
+                label = address
+                log.debug("mDNS answer has no name; labelling %s by its address", address)
+            if instance:
+                service = _strip_dot(instance)
+            else:
+                service = ""
+                log.debug("mDNS answer for %s advertises no service name", label)
             rows.append(
                 {
                     "ip": address,
                     "mac_address": None,
                     "mode": "mdns",
                     "source": "mdns",
-                    "host": hostname or address,
-                    "fqdn": hostname or address,
+                    "host": label,
+                    "fqdn": label,
                     "aliases": ",".join(aliases),
-                    "service": _strip_dot(getattr(info, "name", "") or ""),
+                    "service": service,
                     "port": getattr(info, "port", None),
                 }
             )
 
     if not rows:
+        log.debug("no mDNS answer yielded an address")
         return _empty_table()
+    log.debug("mDNS answers produced %d address row(s)", len(rows))
     return pd.DataFrame(rows)
 
 
@@ -166,17 +220,26 @@ class MdnsFetcher(ARPTableFetcher):
         timeout: float = DEFAULT_TIMEOUT,
         browse: Optional[Callable[[float], Iterable[Any]]] = None,
     ) -> None:
-        self.service_types = list(service_types or SUGGESTED_SERVICE_TYPES)
+        if service_types:
+            self.service_types = list(service_types)
+            log.debug("mDNS will browse %d service type(s)", len(self.service_types))
+        else:
+            self.service_types = list(SUGGESTED_SERVICE_TYPES)
+            log.debug(
+                "no service types given; browsing the %d suggested ones", len(self.service_types)
+            )
         self.timeout = max(0.1, float(timeout))
         self._browse = browse
 
     def available(self) -> bool:
         """Whether ``zeroconf`` can be imported right now."""
         if self._browse is not None:
+            log.debug("an injected browse callable is present; mDNS is available without zeroconf")
             return True
         try:
             __import__("zeroconf")
-        except ImportError:
+        except ImportError as exc:
+            log.debug("the mdns source needs the zeroconf extra: %s", exc)
             return False
         return True
 
@@ -202,7 +265,11 @@ class MdnsFetcher(ARPTableFetcher):
         unimportable without it.
         """
         if self._browse is not None:
+            log.debug("using the injected browse callable for %.1fs", timeout)
             return list(self._browse(timeout))
+        log.debug(
+            "browsing %d service type(s) with zeroconf for %.1fs", len(self.service_types), timeout
+        )
         return _zeroconf_browse(self.service_types, timeout)
 
 
@@ -220,6 +287,7 @@ def _zeroconf_browse(service_types: Sequence[str], timeout: float) -> List[Any]:
 
     class Listener:
         def add_service(self, zc, service_type, name):
+            log.debug("mDNS service announced: %s (%s)", name, service_type)
             try:
                 info = zc.get_service_info(service_type, name, timeout=int(timeout * 1000))
             except Exception as exc:
@@ -227,6 +295,8 @@ def _zeroconf_browse(service_types: Sequence[str], timeout: float) -> List[Any]:
                 return
             if info is not None:
                 found.append(info)
+            else:
+                log.debug("no service info came back for %s; ignoring that announcement", name)
 
         def update_service(self, zc, service_type, name):
             self.add_service(zc, service_type, name)
@@ -236,6 +306,7 @@ def _zeroconf_browse(service_types: Sequence[str], timeout: float) -> List[Any]:
 
     zeroconf = Zeroconf()
     try:
+        log.debug("starting %d zeroconf browser(s) for %.1fs", len(service_types), timeout)
         browsers = [
             ServiceBrowser(zeroconf, service_type, Listener()) for service_type in service_types
         ]

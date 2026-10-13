@@ -234,8 +234,10 @@ def load_env() -> None:
     try:
         from dotenv import load_dotenv
     except ImportError:
+        log.debug("python-dotenv is not installed; using the environment as-is")
         return
     load_dotenv()
+    log.debug(".env loaded into the environment")
 
 
 def main(argv: Optional[Sequence[str]] = None):

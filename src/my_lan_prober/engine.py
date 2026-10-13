@@ -19,7 +19,7 @@ import contextlib
 import logging
 import socket
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -38,6 +38,87 @@ SSH_PORT_CANDIDATES = (22, 2222, 8022)
 SSH_CONFIG_FILENAME = "ssh.sh"
 
 
+#: How many consecutive ports to try before giving up on finding a free one.
+PORT_SEARCH_TRIES = 200
+
+#: Addresses a local listener might be occupying.  A forward binds a local
+#: port, so a listener on *any* of these blocks it — and on a dual-stack host a
+#: process bound only to ``::1`` can still collide with a ``127.0.0.1`` bind,
+#: depending on the socket options in play.  All of them are checked.
+LOOPBACK_ADDRESSES = ("127.0.0.1", "::1", "localhost")
+
+
+def _port_is_free(port: int, hosts: Sequence[str] = LOOPBACK_ADDRESSES) -> bool:
+    """Whether nothing is listening on ``port`` on any loopback address.
+
+    Two checks are needed and neither is sufficient alone:
+
+    * ``connect_ex`` catches a listener that is *running* — the case that makes
+      a second ``ssh.sh`` die at startup;
+    * ``bind`` catches a port in ``TIME_WAIT`` or held by a socket that is not
+      accepting, which a connect test would report as free.
+    """
+    for host in hosts:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            probe = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:  # pragma: no cover - no IPv6 stack
+            continue
+        try:
+            probe.settimeout(0.2)
+            if probe.connect_ex((host, port)) == 0:
+                return False
+        except OSError:
+            # A connect that cannot even be attempted (no such address family
+            # route, for instance) tells us nothing about occupancy.
+            pass
+        finally:
+            probe.close()
+
+        try:
+            holder = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:  # pragma: no cover - no IPv6 stack
+            continue
+        try:
+            # No SO_REUSEADDR: the question is precisely whether *we* could
+            # bind here, and reuse would let us bind a port in TIME_WAIT that
+            # ssh would then refuse.
+            holder.bind((host, port))
+        except OSError:
+            return False
+        finally:
+            holder.close()
+    return True
+
+
+def next_free_local_port(
+    port: int,
+    *,
+    tries: int = PORT_SEARCH_TRIES,
+    hosts: Sequence[str] = LOOPBACK_ADDRESSES,
+) -> int:
+    """The first free port at or above ``port``.
+
+    Raising is deliberate: a silent fallback to the occupied port would produce
+    a script that fails the moment it runs, which is worse than an error at the
+    point the script is written.
+    """
+    if tries < 1:
+        raise RuntimeError(f"no free local port at or above {port}: search disabled")
+
+    for candidate in range(port, port + tries):
+        if _port_is_free(candidate, hosts):
+            return candidate
+    raise RuntimeError(
+        f"no free local port in {port}-{port + tries - 1}; "
+        "close something, or pass a different --output per run"
+    )
+
+
+def _format_jump(user: Optional[str], host: str) -> str:
+    return f"{user}@{host}" if user else host
+
+
 def write_ssh_config(
     data_dir: Path,
     host: str,
@@ -45,6 +126,11 @@ def write_ssh_config(
     port: int,
     tunnels: Optional[List[Tuple[int, int]]] = None,
     local_port_offset: int = 0,
+    *,
+    jumps: Optional[Sequence[str]] = None,
+    jump_user: Optional[str] = None,
+    remote_address: Optional[str] = None,
+    avoid_occupied_ports: bool = True,
 ) -> Path:
     """Write ``<data_dir>/<host>/ssh.sh`` forwarding each tunnelled service.
 
@@ -52,10 +138,33 @@ def write_ssh_config(
         local_port_offset: Added to every local port so several host scripts
             can run at once without colliding (e.g. 1000 turns local 8888
             into 9888).
+        jumps: SSH hosts to reach the target *through*, ordered from this
+            machine outwards.  A host the scan found behind a hop is not
+            routable from here, so the script must go via the hop.  Rendered as
+            ``-J a,b`` — one ssh invocation, chained on the client side.
+        jump_user: Username for the jump hosts, when it differs.
+        remote_address: The address the *far end* of the connection can use for
+            the tunnelled service.  Defaults to ``ip``.  It must never default
+            to ``localhost`` when jumping: that would ask the last hop to
+            forward a port on itself rather than on the target.
+        avoid_occupied_ports: Step the local port upwards when something is
+            already listening on it.  On by default, because a script that
+            cannot bind is a script that does not work.
     """
     directory = Path(data_dir) / host
     directory.mkdir(parents=True, exist_ok=True)
     config_path = directory / SSH_CONFIG_FILENAME
+
+    hop_chain: List[str] = []
+    for hop in jumps or ():
+        name = str(hop).strip()
+        if name and name not in hop_chain:
+            hop_chain.append(name)
+
+    # Behind a hop, the service lives at the far end of the chain, so the
+    # remote half of -L names the target explicitly.  Directly reachable, the
+    # conventional `localhost` is right (and survives the target moving).
+    forward_host = (remote_address or ip) if hop_chain else "localhost"
 
     parts: List[str] = [
         "ssh",
@@ -67,13 +176,29 @@ def write_ssh_config(
         "-o ExitOnForwardFailure=yes",
     ]
 
+    if hop_chain:
+        parts.append("-J " + ",".join(_format_jump(jump_user, hop) for hop in hop_chain))
+
+    forwarded: List[Tuple[int, int]] = []
     if tunnels:
-        seen = set()
+        seen_remote = set()
+        taken_locals: set = set()
         for local_port, remote_port in tunnels:
-            if remote_port in seen:
+            if remote_port in seen_remote:
                 continue
-            seen.add(remote_port)
-            parts.append(f"-L {local_port + local_port_offset}:localhost:{remote_port}")
+            seen_remote.add(remote_port)
+
+            requested = local_port + local_port_offset
+            chosen = requested
+            if avoid_occupied_ports:
+                # Skip anything already listening, and anything already claimed
+                # by an earlier forward in this same script.
+                while chosen in taken_locals or not _port_is_free(chosen):
+                    chosen += 1
+            taken_locals.add(chosen)
+
+            forwarded.append((chosen, remote_port))
+            parts.append(f"-L {chosen}:{forward_host}:{remote_port}")
 
     parts.append(ip)
 
@@ -87,18 +212,26 @@ def write_ssh_config(
     with contextlib.suppress(OSError):
         config_path.chmod(0o755)
 
-    if tunnels:
-        forwarded = ", ".join(f"{lp + local_port_offset}->{rp}" for lp, rp in tunnels)
+    via = f" via {','.join(hop_chain)}" if hop_chain else ""
+    if forwarded:
+        rendered = ", ".join(f"{local}->{remote}" for local, remote in forwarded)
         log.info(
-            "Wrote SSH config for %s -> %s:%d (%d tunnel(s): %s)",
+            "Wrote SSH config for %s -> %s:%d%s (%d tunnel(s): %s)",
             host,
             ip,
             port,
-            len(tunnels),
-            forwarded,
+            via,
+            len(forwarded),
+            rendered,
         )
+        requested_ports = {local for local, _remote in tunnels}
+        moved = [chosen for chosen, _remote in forwarded if chosen not in requested_ports]
+        if moved:
+            # Say so: the numbers in the script are not the numbers the caller
+            # asked for, and the reason is on this machine, not on the target.
+            log.info("  local port(s) moved to avoid a busy port: %s", ", ".join(map(str, moved)))
     else:
-        log.info("Wrote SSH config for %s -> %s:%d (no tunnels)", host, ip, port)
+        log.info("Wrote SSH config for %s -> %s:%d%s (no tunnels)", host, ip, port, via)
     return config_path
 
 
@@ -351,19 +484,43 @@ class Engine:
                 return candidate
         return None
 
+    def _jumps_for(self, row: pd.Series) -> List[str]:
+        """The SSH hop chain this host was discovered through, nearest first.
+
+        ``SSHArpTableExpander`` records the hop a host was seen from in ``via``
+        and how many hops out it was in ``depth``.  A row that came in that way
+        is not routable from here, so its script has to go through the hop —
+        without this the generated command connects directly and simply hangs.
+        """
+        raw = row.get("via")
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            return []
+
+        # ``via`` accumulates when several hops saw the same host, so it is a
+        # comma-separated list.  Ordered as recorded, duplicates dropped.
+        hops: List[str] = []
+        for part in str(raw).split(","):
+            name = part.strip()
+            if name and name not in hops:
+                hops.append(name)
+        return hops
+
     def write_ssh_scripts(self, frame: pd.DataFrame) -> None:
         for _, row in frame.iterrows():
             ssh_port = self._ssh_port(row)
             if ssh_port is None:
                 continue
 
-            # Forward every *other* detected service so, e.g., a Jupyter
-            # server on :8888 becomes reachable at http://localhost:8888.
+            # Forward every *other* port the scan actually reached, so a
+            # Jupyter server on :8888 becomes http://localhost:8888.  The test
+            # is "was anything there", not "was it identified": a port that
+            # answered with a banner we could not name, or that timed out under
+            # a short --port-timeout, is still a port worth forwarding.
             tunnels: List[Tuple[int, int]] = []
             for port in self.config.ports:
                 if port == ssh_port:
                     continue
-                if pd.notna(row.get(f"port_{port}_service")):
+                if self._port_responded(row, port):
                     tunnels.append((port, port))
 
             write_ssh_config(
@@ -372,4 +529,25 @@ class Engine:
                 str(row["ip_address"]),
                 ssh_port,
                 tunnels=tunnels or None,
+                jumps=self._jumps_for(row) or None,
+                remote_address=str(row["ip_address"]),
             )
+
+    @staticmethod
+    def _port_responded(row: pd.Series, port: int) -> bool:
+        """Whether the scan got *anything* back from ``port``.
+
+        A service name means yes.  So does a banner, or any response bytes:
+        those are recorded even when identification failed, and dropping them
+        from the tunnel list was why ports the scan had clearly connected to
+        were missing from the generated script.
+        """
+        for column in (f"port_{port}_service", f"port_{port}_banner"):
+            value = row.get(column)
+            if value is None:
+                continue
+            if isinstance(value, float) and pd.isna(value):
+                continue
+            if str(value).strip():
+                return True
+        return False

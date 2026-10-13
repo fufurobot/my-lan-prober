@@ -85,7 +85,7 @@ def test_hop_reached_host_uses_a_jump_host(tmp_path):
         jumps=["arch-server-main"],
     )
 
-    script = _read(tmp_path)
+    script = _read(tmp_path, "host-b")
 
     assert _jump_hosts(script) == ["arch-server-main"]
 
@@ -101,7 +101,7 @@ def test_hop_chain_is_ordered_from_here_outwards(tmp_path):
         jumps=["bastion", "inner"],
     )
 
-    assert _jump_hosts(_read(tmp_path)) == ["bastion", "inner"]
+    assert _jump_hosts(_read(tmp_path, "deep")) == ["bastion", "inner"]
 
 
 def test_multi_hop_forwards_are_resolved_at_the_far_end(tmp_path):
@@ -121,7 +121,7 @@ def test_multi_hop_forwards_are_resolved_at_the_far_end(tmp_path):
         remote_address="192.168.2.50",
     )
 
-    script = _read(tmp_path)
+    script = _read(tmp_path, "host-b")
 
     assert (8000, "192.168.2.50", 8000) in _forwards(script)
     assert "localhost" not in script.split("-L")[1].split("\n")[0]
@@ -138,7 +138,7 @@ def test_multi_hop_without_a_remote_address_falls_back_to_the_target(tmp_path):
         jumps=["arch-server-main"],
     )
 
-    script = _read(tmp_path)
+    script = _read(tmp_path, "host-b")
 
     remote_hosts = {host for _local, host, _port in _forwards(script)}
     assert remote_hosts == {"192.168.2.50"}
@@ -155,7 +155,7 @@ def test_multi_hop_keeps_one_login_not_two(tmp_path):
         jumps=["arch-server-main"],
     )
 
-    script = _read(tmp_path)
+    script = _read(tmp_path, "host-b")
 
     assert script.count("ssh ") == 1 or script.count("\nssh") <= 1
 
@@ -170,7 +170,7 @@ def test_multi_hop_targets_the_final_host(tmp_path):
         jumps=["arch-server-main"],
     )
 
-    body = _read(tmp_path)
+    body = _read(tmp_path, "host-b")
 
     # The last bare argument before the line continuation ends is the target.
     assert re.search(r"\n\s*192\.168\.2\.50\s*\n", body)
@@ -187,7 +187,7 @@ def test_a_jump_host_account_is_carried_when_given(tmp_path):
         jump_user="root",
     )
 
-    assert "root@arch-server-main" in _read(tmp_path)
+    assert "root@arch-server-main" in _read(tmp_path, "host-b")
 
 
 def test_jumps_are_deduplicated_and_ordered(tmp_path):
@@ -200,7 +200,7 @@ def test_jumps_are_deduplicated_and_ordered(tmp_path):
         jumps=["bastion", "bastion", "inner"],
     )
 
-    assert _jump_hosts(_read(tmp_path)) == ["bastion", "inner"]
+    assert _jump_hosts(_read(tmp_path, "host-b")) == ["bastion", "inner"]
 
 
 # ---------------------------------------------------------------------------

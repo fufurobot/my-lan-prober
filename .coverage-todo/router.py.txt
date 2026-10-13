@@ -1,2 +1,0 @@
-47	try	_importable
-49	except	_importable

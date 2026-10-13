@@ -1,2 +1,0 @@
-622	try	get
-624	except	get

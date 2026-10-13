@@ -299,8 +299,23 @@ print(frame[["host", "ip_address", "detected_services"]])
 | `--expand-depth N` | `ARP_EXPAND_DEPTH` | `2` | How many neighbour tables the walk collects |
 | `--unsafe-tplogin-password PW` | `TPLOGIN_PASSWORD` | prompt | ⚠️ Non-interactive login — leaks to `ps` |
 | `--browser NAME` | `PW_BROWSER` | `auto` | Playwright engine: `auto`/`chromium`/`firefox`/`webkit` |
+| `--verbose [LEVEL]`, `-v` | `PROBESTACK_LOG_LEVEL` | `INFO` | Log more. Bare `--verbose` means `DEBUG`; a level may follow |
 
 **Precedence:** CLI flag > environment variable > default.
+
+`--verbose` takes an *optional* value, so both of these work:
+
+```bash
+my-lan-prober --verbose                 # DEBUG
+my-lan-prober --verbose WARNING         # only warnings and above
+my-lan-prober --verbose=ERROR           # the = form
+my-lan-prober --verbose --output x.csv  # --output is not swallowed
+```
+
+The last case is the reason it is a custom argparse action rather than
+`nargs="?"`: the flag consumes the next token **only** when it is a known level
+name, so a typo'd level is rejected instead of being silently accepted as one,
+and a following option is never eaten.
 
 ## ARP sources and expansion
 
@@ -577,8 +592,9 @@ One unified CSV — `data/tplogin-arp-enriched.csv` by default:
 | `port_<N>_banner` | Truncated banner / first response bytes |
 
 A per-host `data/<host>/ssh.sh` helper is written for every host with an open
-SSH port. It forwards every other detected service, so a JupyterHub found on
-`:8000` becomes reachable at `http://localhost:8000`:
+SSH port. It forwards every other port the scan **reached** — identified or
+not — so a JupyterHub found on `:8000` becomes reachable at
+`http://localhost:8000`:
 
 ```bash
 #!/usr/bin/env bash
@@ -590,6 +606,38 @@ ssh \
     -L 8000:localhost:8000 \
     192.168.1.104
 ```
+
+### Hosts reached through a hop
+
+A host found by the SSH expansion walk (`--expand`) is not routable from your
+machine — only the hop can see it. Its script chains the hops with `-J`, and
+names the target explicitly on the far side of `-L` instead of `localhost`
+(which would ask the last hop to forward a port on *itself*):
+
+```bash
+ssh \
+    -p 22 \
+    -o ExitOnForwardFailure=yes \
+    -J arch-server-main \
+    -L 8888:192.168.2.50:8888 \
+    192.168.2.50
+```
+
+### Local ports that are already busy
+
+Every host wants the same local port, so two scripts cannot both forward
+`:8888`. The generator checks `localhost`, `127.0.0.1` **and** `::1` — a
+listener bound only to `::1` can still block the forward — and steps upward
+until it finds one that is free:
+
+```text
+INFO  Wrote SSH config for host-b -> 192.168.2.50:22 via arch-server-main (1 tunnel(s): 8889->8888)
+INFO    local port(s) moved to avoid a busy port: 8889
+```
+
+Only the *local* side moves; the service stays on its own port. The search is
+bounded, so a saturated range fails at generation time with a clear message
+rather than producing a script that dies on startup.
 
 ## Environment notes
 

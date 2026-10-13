@@ -955,6 +955,29 @@ flowchart LR
 | `--expand-depth` | `ARP_EXPAND_DEPTH` | `2` (tables collected) |
 | `--unsafe-tplogin-password` | `TPLOGIN_PASSWORD` | prompt |
 | `--browser` | `PW_BROWSER` | auto (first installed of chromium/firefox/webkit) |
+| `--verbose [LEVEL]` | `PROBESTACK_LOG_LEVEL` | `INFO` (bare `--verbose` = `DEBUG`) |
+
+### 9a. `--verbose` takes an optional value
+
+`nargs="?"` cannot express this. It consumes any following token that does not
+look like an option, which makes `--verbose WARNING` and `--verbose localhost`
+indistinguishable — a typo'd level becomes a value and the run continues at a
+level nobody asked for — and it silently eats a positional.
+
+`_VerboseAction` consumes the next token **only when it is a known level name**:
+
+| invocation | result |
+|---|---|
+| `--verbose` | `DEBUG`, next token untouched |
+| `--verbose WARNING` | `WARNING` |
+| `--verbose=ERROR` | `ERROR` |
+| `--verbose --output x` | `DEBUG`, `--output` preserved |
+| `--verbose CHATTY` | rejected by argparse |
+| `-v -v` | `DEBUG` (repeating raises, never lowers) |
+
+`configure_logging()` then applies the level with `force=True`, because
+another library may already have installed a root handler and without `force`
+the earliest caller wins and the chosen level is silently ignored.
 
 ```mermaid
 flowchart TD
@@ -1051,7 +1074,57 @@ sequenceDiagram
 
 ---
 
-## 12. Final Confirmations
+## 12. Logging: an enforced invariant
+
+A scanning tool that goes quiet when something interesting happens is not
+debuggable in the field: the one thing you need — *which source did it try, and
+why did it fail?* — is exactly what nobody logs. So "every branch logs" is a
+test, not a convention.
+
+`tests/test_logging_coverage.py` parses every module under `src/` with `ast`,
+enumerates its branches, and requires a logging call in each. It cannot be an
+ordinary behavioural test: a branch that was never taken is invisible when you
+call the code.
+
+| `--coverage-granularity` | pass condition |
+|---|---|
+| `branch` (default) | every branch body contains a logging call |
+| `function` | at least one branch in the function logs |
+| `class` | at least one branch in the class logs |
+| `module` | at least one branch in the module logs |
+
+Each unit is its own parametrised case, and a failure names the file, line,
+branch kind, enclosing function and a source snippet — the point is to fix it
+immediately, not to receive a count.
+
+### What counts as a branch
+
+`if`, `for`, `async for`, `while`, `try`, `except`, `with`, `async with`,
+`match`, and a **standalone** short-circuit `and`/`or`.
+
+A `BoolOp` that is the *test* of a control statement is **not** separate: it is
+part of that statement's single decision, and no log call can live inside a
+boolean expression. `if a and b:` is one branch, instrumented by logging in its
+body. Counting it twice was a bug the first version had — it demanded something
+impossible.
+
+### Using it
+
+```bash
+pytest tests/test_logging_coverage.py                          # every branch
+pytest tests/test_logging_coverage.py --coverage-granularity=function
+pytest tests/test_logging_coverage.py --coverage-min-level=WARNING
+```
+
+The options are declared in `conftest.py`, not in the test module:
+`pytest_addoption` is consulted on plugins and conftest files only, so a hook
+in a test module is never called. They are also namespaced `--coverage-*`
+because pytest already owns `--log-level` and re-declaring it is an argparse
+conflict that stops the run.
+
+---
+
+## 13. Final Confirmations
 
 1. **`SocketBannerHandler(stack, session, ...)`** — `session` is a pre-opened `Session` (usually `AsyncSocketSession` over a live socket). The handler attaches `_persistor` / `_on_io` / `_max_frame_size` to the top of that session. Confirm.
 2. **`_rebind_stack(new_stack)`** — walks to `session.root()` (live socket), then `SessionFactory.upgrade(root, extra)`. Confirm.

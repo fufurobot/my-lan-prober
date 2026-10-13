@@ -100,13 +100,26 @@ class Scope(NamedTuple):
 # AST collection
 # ---------------------------------------------------------------------------
 class _BranchCollector(ast.NodeVisitor):
-    """Collect every branch in a module, tracking its enclosing scopes."""
+    """Collect every branch in a module, tracking its enclosing scopes.
+
+    A short-circuit ``and``/``or`` counts as a branch only when it stands on
+    its own — as a value, or as the whole test of a statement that is *not*
+    itself a branch.  A ``BoolOp`` used as the test of an ``if``/``while`` is
+    part of that statement's single decision, and counting it separately would
+    both double-count the decision and demand something impossible: a boolean
+    expression cannot contain a logging call, so there is nowhere to put the
+    log.  ``if a and b:`` is one branch, and it is instrumented by logging
+    inside its body.
+    """
 
     def __init__(self, file: Path) -> None:
         self.file = file
         self._functions: List[str] = []
         self._classes: List[str] = []
         self.branches: List[Branch] = []
+        #: Test expressions that belong to an enclosing branch node, and so
+        #: are not branches in their own right.
+        self._absorbed: set = set()
 
     # -- scope tracking -------------------------------------------------
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -135,10 +148,25 @@ class _BranchCollector(ast.NodeVisitor):
             )
         )
 
+    def _absorb(self, test: object) -> None:
+        """Mark ``test`` and every BoolOp inside it as part of a branch."""
+        if test is None:
+            return
+        for child in ast.walk(test):  # type: ignore[arg-type]
+            if isinstance(child, ast.BoolOp):
+                self._absorbed.add(id(child))
+
     def generic_visit(self, node: ast.AST) -> None:
         kind = BRANCH_TYPES.get(type(node))
         if kind is not None:
+            if kind == "bool_op" and id(node) in self._absorbed:
+                # Part of an enclosing decision; the enclosing branch is the
+                # unit that must log.
+                return
             self._record(node, kind)
+            if kind != "bool_op":
+                # An if/while/assert-like statement owns its test expression.
+                self._absorb(getattr(node, "test", None))
         super().generic_visit(node)
 
 

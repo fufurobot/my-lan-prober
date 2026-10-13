@@ -62,32 +62,39 @@ def _port_is_free(port: int, hosts: Sequence[str] = LOOPBACK_ADDRESSES) -> bool:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         try:
             probe = socket.socket(family, socket.SOCK_STREAM)
-        except OSError:  # pragma: no cover - no IPv6 stack
+        except OSError as exc:  # pragma: no cover - no IPv6 stack
+            log.debug("cannot build a probe socket for %s: %s", host, exc)
             continue
         try:
             probe.settimeout(0.2)
             if probe.connect_ex((host, port)) == 0:
+                log.debug(
+                    "port %d is occupied on %s: something accepted the connection", port, host
+                )
                 return False
-        except OSError:
+        except OSError as exc:
             # A connect that cannot even be attempted (no such address family
             # route, for instance) tells us nothing about occupancy.
-            pass
+            log.debug("connect test for %s:%d could not be attempted: %s", host, port, exc)
         finally:
             probe.close()
 
         try:
             holder = socket.socket(family, socket.SOCK_STREAM)
-        except OSError:  # pragma: no cover - no IPv6 stack
+        except OSError as exc:  # pragma: no cover - no IPv6 stack
+            log.debug("cannot build a bind socket for %s: %s", host, exc)
             continue
         try:
             # No SO_REUSEADDR: the question is precisely whether *we* could
             # bind here, and reuse would let us bind a port in TIME_WAIT that
             # ssh would then refuse.
             holder.bind((host, port))
-        except OSError:
+        except OSError as exc:
+            log.debug("port %d is not bindable on %s: %s", port, host, exc)
             return False
         finally:
             holder.close()
+    log.debug("port %d is free on all %d loopback address(es)", port, len(hosts))
     return True
 
 
@@ -104,11 +111,14 @@ def next_free_local_port(
     point the script is written.
     """
     if tries < 1:
+        log.warning("free-port search is disabled for %d", port)
         raise RuntimeError(f"no free local port at or above {port}: search disabled")
 
     for candidate in range(port, port + tries):
         if _port_is_free(candidate, hosts):
+            log.debug("chose local port %d (asked for %d)", candidate, port)
             return candidate
+    log.warning("no free local port in %d-%d after %d tries", port, port + tries - 1, tries)
     raise RuntimeError(
         f"no free local port in {port}-{port + tries - 1}; "
         "close something, or pass a different --output per run"
@@ -156,15 +166,28 @@ def write_ssh_config(
     config_path = directory / SSH_CONFIG_FILENAME
 
     hop_chain: List[str] = []
-    for hop in jumps or ():
+    raw_jumps = jumps
+    if raw_jumps is None:
+        raw_jumps = []
+        log.debug("no jump hosts for %s; the script connects directly", host)
+    for hop in raw_jumps:
         name = str(hop).strip()
         if name and name not in hop_chain:
             hop_chain.append(name)
+        else:
+            log.debug("dropping jump host %r: blank, or already in the chain", hop)
 
     # Behind a hop, the service lives at the far end of the chain, so the
     # remote half of -L names the target explicitly.  Directly reachable, the
     # conventional `localhost` is right (and survives the target moving).
-    forward_host = (remote_address or ip) if hop_chain else "localhost"
+    if hop_chain:
+        if remote_address:
+            forward_host = remote_address
+        else:
+            forward_host = ip
+            log.debug("no remote address given; the tunnel targets %s at the far end", ip)
+    else:
+        forward_host = "localhost"
 
     parts: List[str] = [
         "ssh",
@@ -178,6 +201,7 @@ def write_ssh_config(
 
     if hop_chain:
         parts.append("-J " + ",".join(_format_jump(jump_user, hop) for hop in hop_chain))
+        log.debug("routing through %d jump host(s): %s", len(hop_chain), " -> ".join(hop_chain))
 
     forwarded: List[Tuple[int, int]] = []
     if tunnels:
@@ -185,6 +209,9 @@ def write_ssh_config(
         taken_locals: set = set()
         for local_port, remote_port in tunnels:
             if remote_port in seen_remote:
+                log.debug(
+                    "skipping remote port %d: an earlier forward already covers it", remote_port
+                )
                 continue
             seen_remote.add(remote_port)
 
@@ -194,23 +221,31 @@ def write_ssh_config(
                 # Skip anything already listening, and anything already claimed
                 # by an earlier forward in this same script.
                 while chosen in taken_locals or not _port_is_free(chosen):
+                    log.debug("local port %d is busy or claimed; trying %d", chosen, chosen + 1)
                     chosen += 1
+            else:
+                log.debug("occupancy checks are off; binding local port %d as asked", chosen)
             taken_locals.add(chosen)
 
             forwarded.append((chosen, remote_port))
             parts.append(f"-L {chosen}:{forward_host}:{remote_port}")
+    else:
+        log.debug("no tunnels requested for %s; writing a plain ssh command", host)
 
     parts.append(ip)
 
     with open(config_path, "w", encoding="utf-8") as handle:
+        log.debug("opening %s for writing", config_path)
         handle.write("#!/usr/bin/env bash\n")
         handle.write(" \\\n    ".join(parts))
         handle.write("\n")
+    log.debug("wrote %d command line(s) to %s", len(parts), config_path)
 
     # The script must be runnable, but Windows filesystems often refuse the
     # mode bits outright — that is not a reason to fail the whole scan.
     with contextlib.suppress(OSError):
         config_path.chmod(0o755)
+        log.debug("marked %s executable", config_path)
 
     via = f" via {','.join(hop_chain)}" if hop_chain else ""
     if forwarded:
@@ -264,7 +299,9 @@ def build_fetcher(
     fetchers = [registry.create(name, **kwargs) for name in selection]
 
     if len(fetchers) == 1:
+        log.debug("fetcher %r is a single source; returning it directly", kind)
         return fetchers[0]
+    log.debug("fetcher %r selected %d sources; merging them into a TableUnion", kind, len(fetchers))
     return TableUnion(fetchers)
 
 
@@ -319,20 +356,27 @@ class Engine:
         discarded every host the other sources had found.
         """
         fetchers = build_fetchers(self.config)
+        log.debug("built %d ARP source(s) for this run", len(fetchers))
 
         if self.config.expand:
             fetchers = self._with_ssh_expansion(fetchers)
+        else:
+            log.debug("ARP expansion is off; using the %d direct source(s) only", len(fetchers))
 
         if not fetchers:
+            log.error("no ARP source was selected; nothing to scan")
             raise RuntimeError("no ARP source was selected")
 
         union = TableUnion(fetchers, max_task=self.config.max_task)
+        log.debug("merging %d source(s) with max_task=%d", len(fetchers), self.config.max_task)
         frame = union.iptable()
-        log.info(
-            "ARP table: %d host(s) from %s",
-            len(frame),
-            ", ".join(sorted({str(name) for name in frame.get("source", [])})) or "no source",
-        )
+        sources = sorted({str(name) for name in frame.get("source", [])})
+        if not sources:
+            log.debug("the merged table names no source; every source came back empty")
+            source_label = "no source"
+        else:
+            source_label = ", ".join(sources)
+        log.info("ARP table: %d host(s) from %s", len(frame), source_label)
         return frame
 
     def _with_ssh_expansion(self, fetchers: List[Any]) -> List[Any]:
@@ -345,17 +389,35 @@ class Engine:
         direct = [fetcher for fetcher in fetchers if not isinstance(fetcher, SSHArpTableExpander)]
         already = [fetcher for fetcher in fetchers if isinstance(fetcher, SSHArpTableExpander)]
         if already:
+            log.debug(
+                "an SSH expander is already among the %d source(s); not adding a second",
+                len(fetchers),
+            )
             return fetchers
+        log.debug(
+            "%d of %d source(s) are direct; they will feed the expander", len(direct), len(fetchers)
+        )
 
+        if direct:
+            upstream = direct
+        else:
+            log.debug("every selected source is an expander; seeding the walk from all of them")
+            upstream = fetchers
         expander = SSHArpTableExpander(
-            direct or fetchers,
+            upstream,
             hop=self.config.ssh_hop,
             enabled=True,
             max_depth=self.config.expand_depth,
         )
+        if self.config.ssh_hop:
+            log.debug("the SSH walk starts at the configured hop %s", self.config.ssh_hop)
+            hop_label = self.config.ssh_hop
+        else:
+            log.debug("no --ssh-hop given; the walk seeds itself from known_hosts")
+            hop_label = "<from known_hosts>"
         log.info(
             "SSH expansion enabled (hop=%s, depth=%d)",
-            self.config.ssh_hop or "<from known_hosts>",
+            hop_label,
             self.config.expand_depth,
         )
         return [*fetchers, expander]
@@ -380,8 +442,10 @@ class Engine:
         # 3. ICMP ping each lease.
         log.info("Performing ICMP ping check...")
         if len(frame):
+            log.debug("pinging %d host(s)", len(frame))
             frame["icmp_ping"] = frame["ip_address"].map(self.ping)
         else:
+            log.debug("the lease table is empty; skipping the ICMP pass")
             frame["icmp_ping"] = pd.Series(dtype=bool)
 
         # 4. Port probing & service identification.
@@ -389,6 +453,7 @@ class Engine:
             if len(frame):
                 banners = frame["ip_address"].map(lambda ip, p=port: self.probe(ip, p))
             else:
+                log.debug("no hosts to probe on port %d", port)
                 banners = pd.Series(dtype=object)
             frame[f"port_{port}_banner"] = banners
             frame[f"port_{port}_service"] = banners.map(
@@ -417,22 +482,33 @@ class Engine:
         """
         frame = frame.copy()
 
-        if "ip_address" not in frame.columns and "ip" in frame.columns:
-            frame["ip_address"] = frame["ip"]
+        if "ip_address" not in frame.columns:
+            if "ip" in frame.columns:
+                log.debug("source used 'ip'; copying it to 'ip_address'")
+                frame["ip_address"] = frame["ip"]
+            else:
+                log.debug("source has neither 'ip_address' nor 'ip'")
         if "ip" not in frame.columns:
+            log.debug("source has no 'ip' column; mirroring 'ip_address' into it")
             frame["ip"] = frame.get("ip_address")
 
         if "mac_address" not in frame.columns:
+            log.debug("source carries no MAC addresses; filling the column with None")
             frame["mac_address"] = None
 
         if "host" not in frame.columns:
             # ARP tables carry no hostname, so fall back to the address.
+            log.debug("source carries no hostnames; falling back to the address")
             frame["host"] = frame["ip_address"]
 
         if "valid_time" not in frame.columns:
+            log.debug("source carries no lease expiry; filling the column with None")
             frame["valid_time"] = None
 
         frame["host"] = frame["host"].fillna(frame["ip_address"])
+        log.debug(
+            "normalised a table of %d row(s) with columns %s", len(frame), list(frame.columns)
+        )
         return frame
 
     def resolve_and_test_hosts(self) -> pd.DataFrame:
@@ -440,6 +516,7 @@ class Engine:
         for hostname in self.config.resolve_hosts:
             ip = self.resolve(hostname)
             if ip is None:
+                log.debug("recording %s as unresolved; it is not probed", hostname)
                 rows.append(
                     {
                         "hostname": hostname,
@@ -459,14 +536,22 @@ class Engine:
                     services.append(f"{port}:{service}")
                     log.info("    Port %d: %s", port, service)
 
+            if services:
+                detected = "; ".join(services)
+            else:
+                log.debug(
+                    "%s answered on none of the %d probed port(s)", hostname, len(self.config.ports)
+                )
+                detected = None
             rows.append(
                 {
                     "hostname": hostname,
                     "resolved_ip": ip,
                     "icmp_ping": self.ping(ip),
-                    "detected_services": "; ".join(services) if services else None,
+                    "detected_services": detected,
                 }
             )
+        log.debug("resolved and tested %d configured hostname(s)", len(rows))
         return pd.DataFrame(rows)
 
     def _summarise(self, row: pd.Series) -> Optional[str]:
@@ -475,13 +560,22 @@ class Engine:
             service = row.get(f"port_{port}_service")
             if pd.notna(service):
                 services.append(f"{port}:{service}")
-        return "; ".join(services) if services else None
+            else:
+                log.debug("no service identified on port %d for this row", port)
+        if services:
+            log.debug("summarised %d detected service(s)", len(services))
+            return "; ".join(services)
+        log.debug("no identified service on any of the %d probed port(s)", len(self.config.ports))
+        return None
 
     def _ssh_port(self, row: pd.Series) -> Optional[int]:
         for candidate in SSH_PORT_CANDIDATES:
             service = row.get(f"port_{candidate}_service")
             if pd.notna(service) and "SSH" in str(service):
+                log.debug("port %d answered as %r; treating it as the SSH port", candidate, service)
                 return candidate
+            log.debug("port %d is not an SSH service (service=%r)", candidate, service)
+        log.debug("none of %s carried an SSH service for %s", SSH_PORT_CANDIDATES, row.get("host"))
         return None
 
     def _jumps_for(self, row: pd.Series) -> List[str]:
@@ -493,7 +587,13 @@ class Engine:
         without this the generated command connects directly and simply hangs.
         """
         raw = row.get("via")
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        if raw is None:
+            log.debug(
+                "%s was not seen through a hop; its script connects directly", row.get("host")
+            )
+            return []
+        if isinstance(raw, float) and pd.isna(raw):
+            log.debug("%s has a NaN via value; treating it as no hop", row.get("host"))
             return []
 
         # ``via`` accumulates when several hops saw the same host, so it is a
@@ -503,12 +603,18 @@ class Engine:
             name = part.strip()
             if name and name not in hops:
                 hops.append(name)
+            else:
+                log.debug(
+                    "dropping hop %r for %s: blank, or already recorded", part, row.get("host")
+                )
         return hops
 
     def write_ssh_scripts(self, frame: pd.DataFrame) -> None:
+        written = 0
         for _, row in frame.iterrows():
             ssh_port = self._ssh_port(row)
             if ssh_port is None:
+                log.debug("no SSH service on %s; no script written for it", row.get("host"))
                 continue
 
             # Forward every *other* port the scan actually reached, so a
@@ -519,19 +625,39 @@ class Engine:
             tunnels: List[Tuple[int, int]] = []
             for port in self.config.ports:
                 if port == ssh_port:
+                    log.debug("not forwarding port %d: it is the SSH port itself", port)
                     continue
                 if self._port_responded(row, port):
                     tunnels.append((port, port))
+                else:
+                    log.debug("nothing came back on port %d; not forwarding it", port)
 
+            if not tunnels:
+                log.debug(
+                    "%s answered on no other port; writing an un-tunnelled script", row.get("host")
+                )
+            jumps = self._jumps_for(row)
+            if jumps:
+                jump_arg = jumps
+            else:
+                log.debug("no jump chain for %s; the script connects directly", row.get("host"))
+                jump_arg = None
+            if tunnels:
+                tunnel_arg: Optional[List[Tuple[int, int]]] = tunnels
+                log.debug("forwarding %d port(s) through %s", len(tunnels), row.get("host"))
+            else:
+                tunnel_arg = None
             write_ssh_config(
                 self.config.data_dir,
                 str(row["host"]),
                 str(row["ip_address"]),
                 ssh_port,
-                tunnels=tunnels or None,
-                jumps=self._jumps_for(row) or None,
+                tunnels=tunnel_arg,
+                jumps=jump_arg,
                 remote_address=str(row["ip_address"]),
             )
+            written += 1
+        log.debug("wrote %d SSH script(s) for %d row(s)", written, len(frame))
 
     @staticmethod
     def _port_responded(row: pd.Series, port: int) -> bool:
@@ -545,9 +671,13 @@ class Engine:
         for column in (f"port_{port}_service", f"port_{port}_banner"):
             value = row.get(column)
             if value is None:
+                log.debug("no %s recorded for this row", column)
                 continue
             if isinstance(value, float) and pd.isna(value):
+                log.debug("%s is NaN for this row; not a response", column)
                 continue
             if str(value).strip():
+                log.debug("port %d responded (%s=%r)", port, column, value)
                 return True
+            log.debug("%s is present but blank for port %d", column, port)
         return False

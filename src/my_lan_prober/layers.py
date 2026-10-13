@@ -620,9 +620,23 @@ class SessionRegistry:
     @classmethod
     def get(cls, name: str) -> LayerSpec:
         try:
-            return cls._specs[name]
+            spec = cls._specs[name]
         except KeyError:
+            log.warning(
+                "unknown layer %r; %d layer(s) are registered",
+                name,
+                len(cls._specs),
+            )
             raise KeyError(f"unknown layer {name!r}") from None
+
+        # `spec.description or spec.name` would itself be a branch, so the
+        # fallback is resolved first and both cases are named.
+        label = spec.description
+        if not label:
+            label = spec.name
+            log.debug("layer %r has no description; reporting its name", name)
+        log.debug("resolved layer %r -> %s", name, label)
+        return spec
 
     @classmethod
     def names(cls) -> list:

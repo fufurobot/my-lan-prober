@@ -23,7 +23,10 @@ in an environment where none of them are installed; CI asserts exactly that.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict
+
+log = logging.getLogger(__name__)
 
 __all__ = ["ROUTER_CAPABILITIES", "router_capabilities", "missing_capabilities", "describe"]
 
@@ -46,8 +49,10 @@ def _importable(module: str) -> bool:
     """
     try:
         __import__(module)
-    except ImportError:
+    except ImportError as exc:
+        log.debug("capability %r is unavailable: %s", module, exc)
         return False
+    log.debug("capability %r is importable", module)
     return True
 
 

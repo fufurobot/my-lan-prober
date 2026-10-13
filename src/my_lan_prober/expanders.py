@@ -93,8 +93,11 @@ def _asyncssh_available() -> bool:
     import importlib.util
 
     try:
-        return importlib.util.find_spec("asyncssh") is not None
+        found = importlib.util.find_spec("asyncssh") is not None
+        log.debug("asyncssh installed: %s", found)
+        return found
     except (ImportError, ValueError):  # pragma: no cover - broken environment
+        log.debug("could not tell whether asyncssh is installed; assuming it is not")
         return False
 
 
@@ -102,19 +105,27 @@ def _as_fetcher_list(upstream: Any) -> List[ARPTableFetcher]:
     """Normalise ``upstream`` into a list of fetchers, rejecting anything else."""
     if isinstance(upstream, ARPTableFetcher):
         candidates: Iterable[Any] = [upstream]
+        log.debug("upstream is a single fetcher %s", type(upstream).__name__)
     elif isinstance(upstream, (list, tuple)):
         candidates = upstream
+        log.debug("upstream is a sequence of %d candidate(s)", len(upstream))
     else:
         candidates = [upstream]
+        log.debug("upstream is a single non-fetcher candidate %r", type(upstream).__name__)
 
     fetchers: List[ARPTableFetcher] = []
     for candidate in candidates:
         if not isinstance(candidate, ARPTableFetcher):
+            log.debug(
+                "rejecting upstream entry of type %s: not an ARPTableFetcher",
+                type(candidate).__name__,
+            )
             raise TypeError(
                 "an expander's upstream must be an ARPTableFetcher (or a list of them); "
                 f"got {type(candidate).__name__}"
             )
         fetchers.append(candidate)
+    log.debug("upstream resolved to %d fetcher(s)", len(fetchers))
     return fetchers
 
 
@@ -168,6 +179,7 @@ class ArpTableExpander(ARPTableFetcher):
         """
         tables: List[tuple] = []
         for fetcher in self.upstream:
+            log.debug("considering upstream %s for expansion", type(fetcher).__name__)
             if not _is_available(fetcher):
                 log.debug("skipping unavailable upstream %s", type(fetcher).__name__)
                 continue
@@ -175,6 +187,7 @@ class ArpTableExpander(ARPTableFetcher):
                 tables.append((fetcher, _validate_frame(fetcher.iptable())))
             except Exception as exc:
                 log.warning("upstream %s failed: %s", type(fetcher).__name__, exc)
+        log.debug("collected %d upstream table(s)", len(tables))
         return tables
 
     def merged_upstream(self) -> pd.DataFrame:
@@ -189,9 +202,19 @@ class ArpTableExpander(ARPTableFetcher):
         for table in tagged:
             if "depth" in table.columns:
                 table["depth"] = 0
+                log.debug("reset the upstream table's depth to 0 at the expander boundary")
+            else:
+                log.debug("upstream table carries no depth column; it counts as depth 0")
         if not tagged:
+            log.debug("no upstream produced a table; %s expands nothing", type(self).__name__)
             return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
-        return merge_tables(tagged)
+        merged = merge_tables(tagged)
+        log.debug(
+            "merged %d upstream table(s) into %d depth-0 row(s)",
+            len(tagged),
+            len(merged),
+        )
+        return merged
 
     def available(self) -> bool:
         """An expander is available when at least one upstream is."""
@@ -207,6 +230,10 @@ class ArpTableExpander(ARPTableFetcher):
             return base
 
         if extra is None or len(extra) == 0:
+            log.debug(
+                "%s derived no extra row(s); its upstream table stands",
+                type(self).__name__,
+            )
             return base
 
         # Rows that `expand` derived *from* the upstream table inherit its
@@ -226,7 +253,19 @@ class ArpTableExpander(ARPTableFetcher):
             floor=upstream_depth,
         )
         if base.empty:
+            log.debug(
+                "%s derived %d row(s) with no upstream table to merge them into",
+                type(self).__name__,
+                len(extra),
+            )
             return merge_tables([extra])
+        log.debug(
+            "%s added %d row(s) at depth %d on top of %d upstream row(s)",
+            type(self).__name__,
+            len(extra),
+            upstream_depth + 1,
+            len(base),
+        )
         return merge_tables([base, extra])
 
     # -- helper for subclasses -----------------------------------------
@@ -235,9 +274,20 @@ class ArpTableExpander(ARPTableFetcher):
     ) -> pd.DataFrame:
         """Drop rows whose address the upstream table already carries."""
         if base.empty or frame.empty:
+            log.debug(
+                "no upstream coverage to subtract: %d candidate row(s), %d upstream row(s)",
+                len(frame),
+                len(base),
+            )
             return frame
         known = set(base["ip"].astype(str))
-        return frame[~frame["ip"].astype(str).isin(known)].reset_index(drop=True)
+        covered = frame[~frame["ip"].astype(str).isin(known)].reset_index(drop=True)
+        log.debug(
+            "dropped %d of %d candidate row(s) already covered by the upstream table",
+            len(frame) - len(covered),
+            len(frame),
+        )
+        return covered
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +300,15 @@ def _depth_of(frame: pd.DataFrame) -> int:
     one that has not been through an expander yet.
     """
     if frame is None or frame.empty or "depth" not in frame.columns:
+        log.debug("table carries no depth provenance; reporting depth 0")
         return 0
     recorded = pd.to_numeric(frame["depth"], errors="coerce")
     if recorded.isna().all():
+        log.debug("every recorded depth is unusable; reporting depth 0")
         return 0
-    return int(recorded.max())
+    deepest = int(recorded.max())
+    log.debug("deepest provenance level in the table is %d", deepest)
+    return deepest
 
 
 def _reassign_provenance(
@@ -271,9 +325,18 @@ def _reassign_provenance(
     relabelled["source"] = source
     if "depth" not in relabelled.columns:
         relabelled["depth"] = depth
+        log.debug("labelled %d derived row(s) as %s at depth %d", len(relabelled), source, depth)
     else:
         recorded = pd.to_numeric(relabelled["depth"], errors="coerce")
         relabelled["depth"] = recorded.where(recorded > floor, depth).astype(int)
+        kept = int((recorded > floor).sum())
+        log.debug(
+            "relabelled %d derived row(s) as %s at depth %d, keeping %d deeper label(s)",
+            len(relabelled),
+            source,
+            depth,
+            kept,
+        )
     return relabelled
 
 
@@ -294,15 +357,23 @@ def _tag(
     tagged = frame.copy()
     if "source" not in tagged.columns or tagged["source"].isna().all():
         tagged["source"] = source
+        log.debug("tagged %d row(s) with source %s", len(tagged), source)
     else:
+        missing = int(tagged["source"].isna().sum())
         tagged["source"] = tagged["source"].fillna(source)
+        log.debug(
+            "kept the recorded source on %d row(s); filled %d blank one(s)", len(tagged), missing
+        )
     if depth is not None:
         if "depth" not in tagged.columns or tagged["depth"].isna().all():
             tagged["depth"] = depth
+            log.debug("tagged %d row(s) with depth %d", len(tagged), depth)
         else:
             tagged["depth"] = pd.to_numeric(tagged["depth"], errors="coerce")
+            log.debug("kept the depth already recorded on %d row(s)", len(tagged))
     if via is not None:
         tagged["via"] = via
+        log.debug("tagged %d row(s) as reached via %s", len(tagged), via)
     return tagged
 
 
@@ -349,9 +420,11 @@ class TableUnion(ArpTableExpander):
         super().__init__(upstream)
         limit = self.DEFAULT_MAX_TASK if max_task is None else int(max_task)
         if limit < 1:
+            log.debug("rejecting max_task=%r: a union must allow at least one task", max_task)
             raise ValueError(f"max_task must be >= 1, got {max_task!r}")
         #: Concurrency cap for one level.  Named ``max_task`` to match the CLI.
         self.max_task = limit
+        log.debug("%s will run at most %d source(s) at once", type(self).__name__, limit)
 
     # -- the plan -------------------------------------------------------
     def assign_priorities(self) -> dict:
@@ -392,6 +465,7 @@ class TableUnion(ArpTableExpander):
                 if fetcher not in runnable:
                     log.debug("ARP source %s is not available here", type(fetcher).__name__)
             if not runnable:
+                log.debug("phase %d has no runnable source; skipping it", index)
                 continue
 
             log.debug("phase %d: %d source(s)", index, len(runnable))
@@ -407,6 +481,9 @@ class TableUnion(ArpTableExpander):
         router must not cost the scan the other sources' findings.
         """
         if len(fetchers) == 1:
+            log.debug(
+                "phase of one source: running %s without a task pool", type(fetchers[0]).__name__
+            )
             single = self._fetch_one(fetchers[0])
             return [single] if single is not None else []
 
@@ -414,13 +491,17 @@ class TableUnion(ArpTableExpander):
 
         async def guarded(fetcher: ARPTableFetcher):
             async with limiter:
+                log.debug("running %s under the %d-task cap", type(fetcher).__name__, self.max_task)
                 return await asyncio.to_thread(self._fetch_one, fetcher)
 
         async def gather():
+            log.debug("gathering %d source(s) concurrently", len(fetchers))
             return await asyncio.gather(*(guarded(fetcher) for fetcher in fetchers))
 
         results = default_bridge().run(gather())
-        return [table for table in results if table is not None]
+        tables = [table for table in results if table is not None]
+        log.debug("%d of %d source(s) in the phase produced a table", len(tables), len(fetchers))
+        return tables
 
     @staticmethod
     def _fetch_one(fetcher: ARPTableFetcher) -> Optional[tuple]:
@@ -439,16 +520,19 @@ class TableUnion(ArpTableExpander):
         if not self.upstream:
             # A union of nothing is nothing.  Raising here would turn "the
             # caller selected no sources" into a crash on a legitimate input.
+            log.debug("union has no upstream source; returning an empty table")
             return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
 
         tables = self.upstream_tables()
         if not tables:
             available = [fetcher for fetcher in self.upstream if _is_available(fetcher)]
             if available:
+                log.debug("no table, but %d source(s) reported available", len(available))
                 raise RuntimeError(
                     "no ARP source produced a table: "
                     + "; ".join(type(fetcher).__name__ for fetcher in available)
                 )
+            log.debug("all %d ARP source(s) are unavailable here", len(self.upstream))
             raise RuntimeError(
                 "every ARP source is unavailable here: "
                 + ", ".join(type(fetcher).__name__ for fetcher in self.upstream)
@@ -534,8 +618,14 @@ class SSHArpTableExpander(ArpTableExpander):
         import os
 
         if self._hop:
+            log.debug("using the SSH hop configured on the expander: %s", self._hop)
             return self._hop
-        return os.environ.get("SSH_HOP", "").strip() or None
+        from_env = os.environ.get("SSH_HOP", "").strip()
+        if not from_env:
+            log.debug("no hop configured on the expander and SSH_HOP is unset or blank")
+            return None
+        log.debug("no hop configured on the expander; SSH_HOP names %s", from_env)
+        return from_env
 
     def available(self) -> bool:
         """Only an explicitly enabled expander with a hop can run.
@@ -545,21 +635,33 @@ class SSHArpTableExpander(ArpTableExpander):
         opt-out, and one rule for both is easier to reason about than two.
         """
         if not self.enabled:
+            log.debug("SSH expansion is opt-in and not enabled here")
             return False
         if not self.hop:
+            log.debug("SSH expansion has no hop to log into")
             return False
         if self._probe is None and not _asyncssh_available():
             log.warning("SSH expansion needs asyncssh: `uv sync --extra ssh`")
             return False
-        return (
-            any(_is_available(fetcher) for fetcher in self.upstream) or self.seed_from_known_hosts
+        any_upstream_available = any(_is_available(fetcher) for fetcher in self.upstream)
+        if not any_upstream_available and not self.seed_from_known_hosts:
+            log.debug("SSH expansion has no reachable upstream and no known-hosts seeding")
+            return False
+        log.debug(
+            "SSH expansion available: upstream reachable=%s, seed_from_known_hosts=%s",
+            any_upstream_available,
+            self.seed_from_known_hosts,
         )
+        return True
 
     # -- known hosts ----------------------------------------------------
     def known_hosts_path(self) -> Path:
         if self._known_hosts_path is not None:
+            log.debug("using the configured known-hosts file %s", self._known_hosts_path)
             return self._known_hosts_path
-        return Path(KNOWN_HOSTS_TEMPLATE).expanduser()
+        default = Path(KNOWN_HOSTS_TEMPLATE).expanduser()
+        log.debug("no known-hosts file configured; falling back to %s", default)
+        return default
 
     def known_hosts(self) -> List[str]:
         """Host names from the SSH known-hosts file, in file order.
@@ -570,13 +672,15 @@ class SSHArpTableExpander(ArpTableExpander):
         """
         try:
             text = self.known_hosts_path().read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+        except OSError as exc:
+            log.debug("no readable known-hosts file at %s: %s", self.known_hosts_path(), exc)
             return []
 
         hosts: List[str] = []
         for line in text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+                log.debug("skipping blank, comment or hashed known-hosts line")
                 continue
             # The host field is column 0; anything after it is key material.
             field = stripped.split()[0]
@@ -584,12 +688,16 @@ class SSHArpTableExpander(ArpTableExpander):
             if field.startswith("@"):
                 parts = stripped.split()
                 if len(parts) < 2:
+                    log.debug("known-hosts marker %s names no host; skipping the line", field)
                     continue
                 field = parts[1]
             for name in field.split(","):
                 name = name.strip()
                 if name and name not in hosts:
                     hosts.append(name)
+                else:
+                    log.debug("ignoring repeated or empty known-hosts alias %r", name)
+        log.debug("read %d host alias(es) from the known-hosts file", len(hosts))
         return hosts
 
     def seed_hosts(self, base: pd.DataFrame) -> List[str]:
@@ -597,11 +705,17 @@ class SSHArpTableExpander(ArpTableExpander):
         seeds: List[str] = []
         if self.hop:
             seeds.append(self.hop)
+            log.debug("seeding the walk with the configured hop %s", self.hop)
         for column in ("fqdn", "host", "ip"):
             if column in base.columns:
                 for value in base[column].dropna().astype(str):
                     if value and value not in seeds:
                         seeds.append(value)
+                    else:
+                        log.debug(
+                            "upstream column %s repeats seed host %r; skipping it", column, value
+                        )
+        log.debug("seeded the SSH walk with %d host(s)", len(seeds))
         return seeds
 
     # -- probing --------------------------------------------------------
@@ -611,7 +725,12 @@ class SSHArpTableExpander(ArpTableExpander):
 
         import asyncssh
 
-        target = f"{self.username}@{host}" if self.username else host
+        if self.username:
+            target = f"{self.username}@{host}"
+            log.debug("probing %s as %s on port %d", host, self.username, self.port)
+        else:
+            target = host
+            log.debug("probing %s with the default SSH user on port %d", host, self.port)
 
         async def run() -> str:
             async with asyncssh.connect(
@@ -619,41 +738,77 @@ class SSHArpTableExpander(ArpTableExpander):
                 port=self.port,
                 connect_timeout=self.timeout,
             ) as connection:
+                log.debug("SSH connection to %s established on port %d", target, self.port)
                 for command in self.COMMANDS:
                     result = await connection.run(command, check=False)
-                    output = getattr(result, "stdout", "") or ""
-                    if isinstance(output, bytes):
-                        output = output.decode("utf-8", "ignore")
+                    raw = getattr(result, "stdout", "")
+                    if not raw:
+                        log.debug("remote %s returned no stdout at all for %r", host, command)
+                        raw = ""
+                    else:
+                        log.debug("remote %s returned %d byte(s) of stdout", host, len(raw))
+                    if isinstance(raw, bytes):
+                        log.debug(
+                            "remote %s returned bytes for %r; decoding as UTF-8", host, command
+                        )
+                        output = raw.decode("utf-8", "ignore")
+                    else:
+                        output = raw
                     if output.strip():
+                        log.debug(
+                            "remote %s answered %r with %d byte(s)", host, command, len(output)
+                        )
                         return output
+                    log.debug("remote %s produced no output for %r", host, command)
+                log.debug("no neighbour command produced output on %s", host)
                 return ""
 
         return asyncio.run(run())
 
     def _probe_host(self, host: str) -> str:
         """Probe one host, through the injected probe or the real one."""
-        probe = self._probe or (lambda target, command=None, **kwargs: self.ssm_probe(target))
+        if self._probe:
+            probe = self._probe
+            log.debug("probing %s through the injected probe", host)
+        else:
+
+            def probe(target: str, command: Optional[str] = None, **kwargs: Any) -> str:
+                return self.ssm_probe(target)
+
+            log.debug("probing %s through the default SSH probe", host)
         try:
             # The injected probe is called with the host and a representative
             # command, so a test can see *what* would be run without a network.
+            log.debug("probing %s with %r", host, self.COMMANDS[0])
             output = probe(host, self.COMMANDS[0])
         except TypeError:
+            log.debug(
+                "probe of %s accepts no command argument; calling it with the host alone", host
+            )
             output = probe(host)
         except Exception as exc:
             log.warning("SSH probe of %s failed: %s", host, exc)
             return ""
         if isinstance(output, bytes):
+            log.debug("probe of %s returned bytes; decoding as UTF-8", host)
             output = output.decode("utf-8", "ignore")
-        return output or ""
+        if not output:
+            log.debug("probe of %s returned nothing", host)
+            return ""
+        log.debug("probe of %s returned %d character(s)", host, len(output))
+        return output
 
     @staticmethod
     def parse_neighbour_output(output: str) -> pd.DataFrame:
         """Parse remote neighbour output with the fetchers' own parsers."""
         if not output.strip():
+            log.debug("remote neighbour table was empty; nothing to parse")
             return pd.DataFrame(columns=["ip", "mac_address", "mode"])
         frame = parse_proc_net_arp(output)
         if frame.empty:
+            log.debug("output is not a /proc/net/arp table; retrying with the ip-neigh parser")
             frame = parse_ip_neigh(output)
+        log.debug("parsed %d neighbour row(s) from the remote host", len(frame))
         return frame
 
     # -- the expansion --------------------------------------------------
@@ -669,33 +824,54 @@ class SSHArpTableExpander(ArpTableExpander):
         collected: List[pd.DataFrame] = []
         pending: List[tuple] = [(host, 1) for host in self.seed_hosts(frame)]
         visited = set()
+        log.debug(
+            "SSH walk starting from %d seed host(s), bounded to %d table(s)",
+            len(pending),
+            self.max_depth,
+        )
 
         while pending and len(collected) < self.max_depth:
             host, depth = pending.pop(0)
             if host in visited:
+                log.debug("hop %s at depth %d was already visited; skipping it", host, depth)
                 continue
             visited.add(host)
 
             output = self._probe_host(host)
             table = self.parse_neighbour_output(output)
             if table.empty:
+                log.debug("hop %s at depth %d revealed no neighbour", host, depth)
                 continue
 
             table = _tag(table, source=type(self).__name__, depth=depth, via=host)
             collected.append(table)
             log.info("SSH expansion via %s: %d host(s)", host, len(table))
+            log.debug("hop %s at depth %d revealed %d host(s)", host, depth, len(table))
 
             for discovered in table["ip"].dropna().astype(str):
                 if discovered not in visited:
                     pending.append((discovered, depth + 1))
+                else:
+                    log.debug("discovered host %s is already visited; not queueing it", discovered)
 
         if not collected:
+            log.debug(
+                "SSH walk from %d seed host(s) found no neighbour table within depth %d",
+                len(visited),
+                self.max_depth,
+            )
             return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
         # No coverage filter here: the whole point of the walk is to reach
         # hosts the upstream table *could not* see.  A remote neighbour table
         # legitimately reports addresses the local table also knows — that is
         # agreement, not redundancy — and merge_tables() deduplicates them.
-        return merge_tables(collected)
+        merged = merge_tables(collected)
+        log.debug(
+            "SSH walk collected %d hop table(s) reaching %d host(s)",
+            len(collected),
+            len(merged),
+        )
+        return merged
 
 
 # ---------------------------------------------------------------------------
@@ -720,14 +896,18 @@ class SSHHopExpander(ArpTableExpander):
         )
         self.hops: List[str] = list(chain.hops)
         self._fetcher_for = fetcher_for
+        log.debug("SSH hop chain resolved to %d hop(s): %s", len(self.hops), " > ".join(self.hops))
         super().__init__([])
 
     def available(self) -> bool:
+        if not self.hops:
+            log.debug("SSH hop expander has an empty hop chain")
         return bool(self.hops)
 
     def expand(self, frame: pd.DataFrame) -> pd.DataFrame:
         collected: List[pd.DataFrame] = []
         for index, hop in enumerate(self.hops, start=1):
+            log.debug("probing hop %d of %d: %s", index, len(self.hops), hop)
             try:
                 fetcher = self._fetcher_for(hop)
                 table = _validate_frame(fetcher.iptable())
@@ -735,16 +915,20 @@ class SSHHopExpander(ArpTableExpander):
                 log.warning("SSH hop %s failed: %s", hop, exc)
                 continue
             if table.empty:
+                log.debug("hop %s at depth %d produced no row", hop, index)
                 continue
             collected.append(_tag(table, source=type(self).__name__, depth=index, via=hop))
+            log.debug("hop %s at depth %d produced %d row(s)", hop, index, len(table))
 
         if not collected:
+            log.debug("none of the %d SSH hop(s) produced a table", len(self.hops))
             return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
         # Each hop's rows are labelled with that hop and nothing else: walking
         # bastion → jump → target describes three machines, and flattening them
         # into one `via` would throw away which one a row came from.
         merged = merge_tables(collected)
         merged["depth"] = merged["depth"].fillna(0).astype(int)
+        log.debug("merged %d hop table(s) into %d row(s)", len(collected), len(merged))
         return merged
 
 

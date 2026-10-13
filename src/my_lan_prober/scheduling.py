@@ -36,7 +36,10 @@ the caller can make, and guessing would silently reorder their sources.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "PriorityGraph",
@@ -82,11 +85,17 @@ def resolve_dependency_names(
     The order inside ``dependency()`` is ignored entirely, which is why the
     result is a set.
     """
+    # Identity key -> fetcher, so a log line can name the source a resolved
+    # dependency points at instead of printing an opaque ``Class#id`` key.
+    fetchers_by_key: Dict[str, Any] = {_key_of(fetcher): fetcher for fetcher in fetchers}
+
     # declared label -> every identity key that label refers to
     matching: Dict[str, Set[str]] = {}
     for fetcher in fetchers:
         key = _key_of(fetcher)
+        log.debug("dependency index: %s is known as %s", display_name(fetcher), key)
         for label in (key, type(fetcher).__name__, display_name(fetcher)):
+            log.debug("dependency label %r resolves to source %s", label, key)
             matching.setdefault(label, set()).add(key)
 
     resolved: Dict[str, Set[str]] = {}
@@ -96,13 +105,22 @@ def resolve_dependency_names(
         for declared in _iter_dependencies(fetcher):
             label = _declared_label(declared)
             if label is None:
+                log.debug("source %s declared an unnamed dependency; ignoring it", own)
                 continue
             for key in matching.get(label, set()):
                 if key != own:
                     # A fetcher naming itself is a no-op, not a cycle: it is
                     # the obvious thing to write when a source is its own
                     # fallback.
+                    log.debug(
+                        "source %s depends on %s (declared as %r)",
+                        display_name(fetcher),
+                        display_name(fetchers_by_key.get(key, key)),
+                        label,
+                    )
                     deps.add(key)
+        if not deps:
+            log.debug("source %s declares no schedulable dependency", display_name(fetcher))
         resolved[own] = deps
     return resolved
 
@@ -111,7 +129,9 @@ def display_name(fetcher: Any) -> str:
     """What to call a fetcher in a log line or an error message."""
     name = getattr(fetcher, "name", None)
     if isinstance(name, str) and name:
+        log.debug("source %r presents itself as %r", _key_of(fetcher), name)
         return name
+    log.debug("source %r has no name; falling back to its class name", _key_of(fetcher))
     return type(fetcher).__name__
 
 
@@ -141,14 +161,22 @@ def _iter_dependencies(fetcher: Any) -> Iterable[Any]:
     try:
         declared = fetcher.dependency()
     except AttributeError:
+        log.debug("source %s declares no dependency() method", display_name(fetcher))
         return ()
     if declared is None:
+        log.debug("source %s declares dependency() = None; treating it as a root", _key_of(fetcher))
         return ()
     if isinstance(declared, (type, str)):
+        log.debug("source %s declared a single dependency %r", _key_of(fetcher), declared)
         return (declared,)
     try:
         return tuple(declared)
     except TypeError:
+        log.debug(
+            "source %s declared a non-iterable dependency %r; treating it as one entry",
+            _key_of(fetcher),
+            declared,
+        )
         return (declared,)
 
 
@@ -159,14 +187,23 @@ def _declared_label(declared: Any) -> Optional[str]:
     depend on one specific source rather than on every instance of its class.
     """
     if declared is None:
+        log.debug("a dependency declaration is None and names no source")
         return None
     if isinstance(declared, str):
+        log.debug("dependency declaration %r is a name", declared)
         return declared
     if isinstance(declared, type):
+        log.debug("dependency declaration %r is a class", declared.__name__)
         return declared.__name__
     if hasattr(declared, "iptable"):
         # A fetcher instance: refer to it by identity, not by class name.
-        return _key_of(declared)
+        key = _key_of(declared)
+        log.debug("dependency declaration is the fetcher instance %s", key)
+        return key
+    log.debug(
+        "dependency declaration %r is neither a class nor a fetcher; using its class name",
+        type(declared).__name__,
+    )
     return type(declared).__name__
 
 
@@ -187,6 +224,7 @@ def level_for(fetchers: Sequence[Any]) -> Dict[str, int]:
     """
     fetchers = list(fetchers)
     if not fetchers:
+        log.debug("no sources to schedule; the plan is empty")
         return {}
 
     keys = {_key_of(fetcher) for fetcher in fetchers}
@@ -194,6 +232,12 @@ def level_for(fetchers: Sequence[Any]) -> Dict[str, int]:
 
     deferred = {key for key in keys if _priority_of(fetchers, key) < 0}
     non_deferred = keys - deferred
+    log.debug(
+        "scheduling %d source(s): %d deferred, %d non-deferred",
+        len(keys),
+        len(deferred),
+        len(non_deferred),
+    )
 
     edges: Dict[str, Set[str]] = {}
     for key, deps in declared.items():
@@ -201,6 +245,11 @@ def level_for(fetchers: Sequence[Any]) -> Dict[str, int]:
         if key in deferred:
             # Deferral, spelled as an edge: wait for everything not deferred.
             effective |= non_deferred
+            log.debug(
+                "source %s is deferred below %d non-deferred source(s)",
+                key,
+                len(non_deferred),
+            )
         edges[key] = effective
 
     depth = _depths(edges, labels={_key_of(fetcher): display_name(fetcher) for fetcher in fetchers})
@@ -219,9 +268,18 @@ def level_for(fetchers: Sequence[Any]) -> Dict[str, int]:
         gap = min(level[key] for key in non_deferred) - max(level[key] for key in deferred)
         if gap <= 0:
             shift = gap - 1
+            log.debug(
+                "deferred group overlaps the non-deferred levels (gap %d); shifting it down by %d",
+                gap,
+                -shift,
+            )
             for key in deferred:
                 level[key] += shift
+                log.debug("source %s shifted to level %d", key, level[key])
+        else:
+            log.debug("deferred group already sits %d level(s) below the non-deferred ones", gap)
 
+    log.debug("assigned %d scheduling level(s): %s", len(level), level)
     return level
 
 
@@ -232,7 +290,13 @@ def _priority_of(fetchers: Sequence[Any], key: str) -> int:
             try:
                 return int(getattr(fetcher, "priority", 0))
             except (TypeError, ValueError):
+                log.debug(
+                    "source %s has a non-numeric priority %r; treating it as 0",
+                    key,
+                    getattr(fetcher, "priority", None),
+                )
                 return 0
+    log.debug("no selected source has identity %s; its declared priority is unknown", key)
     return 0
 
 
@@ -243,20 +307,25 @@ def _depths(edges: Dict[str, Set[str]], labels: Optional[Dict[str, str]] = None)
 
     def visit(name: str) -> int:
         if name in depth:
+            log.debug("node %s already has depth %d", name, depth[name])
             return depth[name]
         if name in path:
+            log.debug("cyclic dependency re-entered %s on path %s", name, " -> ".join(path))
             raise DependencyCycle([*path[path.index(name) :], name], labels)
         path.append(name)
         try:
             deps = edges.get(name, set())
             value = 0 if not deps else 1 + max(visit(dep) for dep in sorted(deps))
+            log.debug("node %s has depth %d over %d dependency/ies", name, value, len(deps))
         finally:
             path.pop()
         depth[name] = value
         return value
 
     for name in sorted(edges):
+        log.debug("walking the dependency graph from %s", name)
         visit(name)
+    log.debug("depth of the dependency graph: %s", depth)
     return depth
 
 
@@ -290,10 +359,13 @@ class PriorityGraph:
         """
         for key, fetcher in self.by_key.items():
             if key not in self.levels:
+                log.debug("source %s was not assigned a level; leaving its priority alone", key)
                 continue
             try:
                 fetcher.priority = self.levels[key]
+                log.debug("wrote level %d onto %s", self.levels[key], display_name(fetcher))
             except AttributeError:  # pragma: no cover - defensive
+                log.debug("source %s does not accept a priority attribute", key)
                 log_free_warning(display_name(fetcher))
         return {
             display_name(self.by_key[key]): level
@@ -310,13 +382,22 @@ class PriorityGraph:
         """
         grouped: List[List[Any]] = []
         for level in sorted(set(self.levels.values()), reverse=True):
-            batch = [
-                self.by_key[key]
-                for key in sorted(self.levels, key=lambda k: display_name(self.by_key[k]))
-                if self.levels[key] == level and key in self.by_key
-            ]
+            keys = sorted(self.levels, key=lambda k: display_name(self.by_key[k]))
+            batch = []
+            for key in keys:
+                if self.levels[key] == level and key in self.by_key:
+                    batch.append(self.by_key[key])
+                else:
+                    log.debug("source %s is not part of level %d", key, level)
             if batch:
+                log.debug(
+                    "level %d holds %d source(s): %s",
+                    level,
+                    len(batch),
+                    ", ".join(display_name(fetcher) for fetcher in batch),
+                )
                 grouped.append(batch)
+        log.debug("execution plan has %d phase(s), highest level first", len(grouped))
         return grouped
 
     def plan(self) -> List[List[str]]:
@@ -326,7 +407,9 @@ class PriorityGraph:
     def phase_of(self, name: str) -> Optional[int]:
         for index, phase in enumerate(self.plan()):
             if name in phase:
+                log.debug("source %s runs in phase %d", name, index)
                 return index
+        log.debug("no source named %s appears in the plan", name)
         return None
 
 

@@ -218,6 +218,103 @@ def test_log_level_env_is_picked_up(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# --verbose: a flag that may or may not take a value
+# ---------------------------------------------------------------------------
+def test_verbose_alone_means_debug(monkeypatch):
+    """Bare ``--verbose`` is the common case: "show me everything"."""
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve(["--verbose"]).log_level == "DEBUG"
+
+
+def test_verbose_accepts_an_explicit_level(monkeypatch):
+    """``--verbose WARNING`` must be usable, not silently swallowed as a host."""
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve(["--verbose", "WARNING"]).log_level == "WARNING"
+
+
+def test_verbose_level_is_case_insensitive(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve(["--verbose", "warning"]).log_level == "WARNING"
+
+
+def test_verbose_accepts_the_equals_form(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve(["--verbose=ERROR"]).log_level == "ERROR"
+
+
+def test_verbose_does_not_swallow_the_next_flag(monkeypatch):
+    """The hard part of an optional-value flag: ``--verbose --output x``.
+
+    If ``--verbose`` greedily took the next token it would eat ``--output``,
+    and the run would lose its output path.
+    """
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    config = Config.resolve(["--verbose", "--output", "out.csv"])
+
+    assert config.log_level == "DEBUG"
+    assert config.output == "out.csv"
+
+
+def test_verbose_does_not_swallow_a_positional_looking_value(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    config = Config.resolve(["--verbose", "--resolve-host", "localhost"])
+
+    assert config.log_level == "DEBUG"
+    assert config.resolve_hosts == ["localhost"]
+
+
+def test_verbose_rejects_an_unknown_level(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    with pytest.raises(SystemExit):
+        Config.resolve(["--verbose", "CHATTY"])
+
+
+def test_verbose_short_form(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve(["-v"]).log_level == "DEBUG"
+
+
+def test_verbose_overrides_the_environment(monkeypatch):
+    monkeypatch.setenv("PROBESTACK_LOG_LEVEL", "ERROR")
+
+    assert Config.resolve(["--verbose", "DEBUG"]).log_level == "DEBUG"
+
+
+def test_no_verbose_keeps_the_environment_level(monkeypatch):
+    monkeypatch.setenv("PROBESTACK_LOG_LEVEL", "WARNING")
+
+    assert Config.resolve([]).log_level == "WARNING"
+
+
+def test_verbose_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve([]).log_level == "INFO"
+
+
+def test_verbose_accepts_every_standard_level(monkeypatch):
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    for level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        assert Config.resolve(["--verbose", level]).log_level == level
+
+
+def test_verbose_then_a_bare_verbose_again(monkeypatch):
+    """Repeating the flag must not turn the second one into a value."""
+    monkeypatch.delenv("PROBESTACK_LOG_LEVEL", raising=False)
+
+    assert Config.resolve(["--verbose", "--verbose"]).log_level == "DEBUG"
+
+
+# ---------------------------------------------------------------------------
 # Browser engine selection
 # ---------------------------------------------------------------------------
 def test_browser_defaults_to_none_meaning_auto_detect(monkeypatch):
